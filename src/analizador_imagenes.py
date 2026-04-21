@@ -96,6 +96,10 @@ def init_db():
             longitud REAL
         )
     ''')
+
+    cursor.execute("DELETE FROM fotos")
+    cursor.execute("DELETE FROM sqlite_sequence WHERE name='fotos'")
+        
     conn.commit()
     return conn
 
