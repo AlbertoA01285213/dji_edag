@@ -8,7 +8,7 @@ from PIL.ExifTags import TAGS, GPSTAGS
 import cv2
 
 # --- CONFIGURACIÓN ---
-PATH_DJI = Path.home() / "Downloads" / "dji"
+PATH_DJI = Path.home() / "Downloads" / "dji_2"
 DB_NAME = "imagenes_dji.db"
 MARGEN = 0.3
 

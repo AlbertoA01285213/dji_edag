@@ -1,0 +1,2 @@
+### App
+Aqui encontraras todo lo necesario para la app. En este modo, el dron DJI ira tomando una foto por cada cajon de estacionamiento. La aplicacion leera cada imagen y mostrara la posicion de la informacion que detecte en el mapa usando metadata.
