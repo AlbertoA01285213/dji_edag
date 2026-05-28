@@ -50,6 +50,11 @@ print("Cargando modelos YOLO en el Servidor...")
 modelo_etiqueta = YOLO(PATH_MODELO_ETIQUETA)
 modelo_codigos = YOLO(PATH_MODELO_CODIGOS)
 
+data_barcode_anterior = "---"
+data_qr_anterior = "---"
+data_vin_anterior = "---"
+data_datamax_anterior = "---"
+
 
 class VideoPayload(BaseModel):
     ruta_video: str
@@ -138,7 +143,7 @@ def dibujar_boxes(img, resultados):
             conf = det['conf']
             mask = det['mask']
 
-            cv2.rectangle(debug_img, (x, y), (x + w, y + h), color, 2)
+            cv2.rectangle(debug_img, (x, y), (x + w, y + h), color, 4)
             texto = f"{label}: {conf:.2f}"
             cv2.putText(debug_img, texto, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             
@@ -185,18 +190,51 @@ def bucle_vision_artificial(video_path):
     frame_num = 0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
+    ultimos_datos = {
+        "barcode": "—",
+        "qr": "—",
+        "vin": "—",
+        "datamax": "—"
+    }
+
+    frame_null = np.zeros((280, 280, 3), dtype=np.uint8)
+    frame_null = cv2.putText(frame_null, "Etiqueta no encontrada", (30, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+    frame_null = optimizar_y_convertir_base64(frame_null, 280)
+
+
     while cap.isOpened() and not DEBE_PARAR:
         ret, frame = cap.read()
         if not ret:
             break
         frame_num += 1
 
+        data_barcode = ultimos_datos["barcode"]
+        data_qr = ultimos_datos["qr"]
+        data_vin = ultimos_datos["vin"]
+        data_datamax = ultimos_datos["datamax"]
+
         t_init = time.time()
 
         data_img_analizada = analizar_imagen(frame, modelo_etiqueta, usar_tracking=True, frame_num=frame_num)
 
         lista_etiquetas = extraer_todas_las_detecciones(data_img_analizada)
+
         if not lista_etiquetas:
+            ESTADO_PROCESO["frame"] = optimizar_y_convertir_base64(frame, 640)
+            ESTADO_PROCESO["recorte_etiqueta"] = frame_null
+            ESTADO_PROCESO["recorte_barcode"] = frame_null
+            ESTADO_PROCESO["recorte_qr"] = frame_null
+            ESTADO_PROCESO["recorte_vin"] = frame_null
+            ESTADO_PROCESO["recorte_datamax"] = frame_null
+
+            ESTADO_PROCESO["data_barcode"] = data_barcode
+            ESTADO_PROCESO["data_qr"] = data_qr
+            ESTADO_PROCESO["data_vin"] = data_vin
+            ESTADO_PROCESO["data_datamax"] = data_datamax
+
+            ESTADO_PROCESO["data_tiempo_procesamiento"] = "---"
+            ESTADO_PROCESO["data_num_frame"] = int(frame_num)
+            ESTADO_PROCESO["data_num_frame_max"] = int(total_frames)
             continue
 
         etiqueta_encontrada = max(lista_etiquetas, key=lambda x: x['conf'])
@@ -214,33 +252,39 @@ def bucle_vision_artificial(video_path):
         vin_det = obtener_mejor_deteccion(data_codigos_analizados, 'CVE_COM')
         datamax_det = obtener_mejor_deteccion(data_codigos_analizados, 'DATAMATRIX_NUM')
 
-        data_barcode, data_qr, data_vin, data_datamax = "—", "—", "—", "—"
         img_barcode_b64, img_qr_b64, img_vin_b64, img_datamax_b64 = None, None, None, None
 
         if barcode_det:
             crop = recortar_frame(img_etiqueta, barcode_det['bbox'])
             img_barcode_b64 = optimizar_y_convertir_base64(crop, 280)
             scan = zxingcpp.read_barcode(crop)
-            if scan and scan.text: data_barcode = scan.text
+            if scan and scan.text: 
+                data_barcode = scan.text
+                ultimos_datos["barcode"] = scan.text
 
         if qr_det:
             crop = recortar_frame(img_etiqueta, qr_det['bbox'])
             img_qr_b64 = optimizar_y_convertir_base64(crop, 280)
             scan = zxingcpp.read_barcode(crop)
-            if scan and scan.text: data_qr = scan.text
+            if scan and scan.text: 
+                data_qr = scan.text
+                ultimos_datos["qr"] = scan.text
 
         if vin_det:
             crop = recortar_frame(img_etiqueta, vin_det['bbox'])
             img_vin_b64 = optimizar_y_convertir_base64(crop, 280)
             scan = zxingcpp.read_barcode(crop)
-            if scan and scan.text: data_vin = scan.text
+            if scan and scan.text: 
+                data_vin = scan.text
+                ultimos_datos["vin"] = scan.text
 
         if datamax_det:
             crop = recortar_frame(img_etiqueta, datamax_det['bbox'])
             img_datamax_b64 = optimizar_y_convertir_base64(crop, 280)
             scan = zxingcpp.read_barcode(crop)
-            if scan and scan.text: data_datamax = scan.text
-
+            if scan and scan.text: 
+                data_datamax = scan.text
+                ultimos_datos["datamax"] = scan.text
 
         t_fin = time.time() - t_init
 

@@ -32,51 +32,79 @@ class ZonaArrastrarVideo(QFrame):
     def __init__(self, al_seleccionar_archivo_callback):
         super().__init__()
         self.callback_archivo = al_seleccionar_archivo_callback
-        
         self.setFrameShape(QFrame.StyledPanel)
         self.setFrameShadow(QFrame.Sunken)
-        # Estilo visual de caja gris con bordes punteados (estilo dropzone)
         self.setStyleSheet("""
-            QFrame {
-                border: 2px dashed #3498db;
-                border-radius: 8px;
-                background-color: #ecf0f1;
-            }
-            QFrame:hover {
-                background-color: #e8f4f8;
-                border: 2px dashed #2980b9;
-            }
+            QFrame { border: 2px dashed #3498db; border-radius: 8px; background-color: #ecf0f1; }
+            QFrame:hover { background-color: #e8f4f8; border: 2px dashed #2980b9; }
         """)
-        self.setMinimumHeight(150)
-        self.setAcceptDrops(True) # ¡CRÍTICO para permitir Drag & Drop!
+        self.setMinimumHeight(120)
+        self.setAcceptDrops(True)
 
-        # Texto interno instructivo
         layout = QVBoxLayout()
-        self.label_info = QLabel("Arrastra y suelta tu archivo de video aquí\n— o —")
+        self.label_info = QLabel("Arrastra y suelta tu archivo de VIDEO aquí\n(.mp4, .avi, .mkv, .mov)")
         self.label_info.setAlignment(Qt.AlignCenter)
-        self.label_info.setStyleSheet("color: #7f8c8d; font-size: 14px; font-weight: bold; border: none; background: transparent;")
+        self.label_info.setStyleSheet("color: #7f8c8d; font-size: 13px; font-weight: bold; border: none; background: transparent;")
         layout.addWidget(self.label_info)
         self.setLayout(layout)
 
-    # Evento cuando el mouse entra arrastrando algo
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
-            # Verificar que sea un archivo local
             urls = event.mimeData().urls()
             if urls and urls[0].toLocalFile():
-                event.acceptProposedAction() # Aceptar la acción visual de copia
+                event.acceptProposedAction()
 
-    # Evento cuando el operador suelta el archivo definitivo
     def dropEvent(self, event):
         for url in event.mimeData().urls():
             ruta_archivo = url.toLocalFile()
-            # Validar de forma sencilla que tenga extensión de video común
             if ruta_archivo.lower().endswith(('.mp4', '.avi', '.mkv', '.mov')):
                 self.callback_archivo(ruta_archivo)
                 event.acceptProposedAction()
             else:
-                QMessageBox.warning(self, "Archivo no válido", "Por favor, arrastra solo archivos de video (.mp4, .avi, .mkv, .mov).")
+                # CORRECCIÓN: Estilo explícito para evitar texto blanco oculto
+                msg = QMessageBox(QMessageBox.Warning, "Archivo no válido", "Por favor, arrastra solo archivos de video (.mp4, .avi, .mkv, .mov).", parent=self)
+                msg.setStyleSheet("QLabel{ color: #2c3e50; } QPushButton{ background-color: #dcdde1; color: black; }")
+                msg.exec()
 
+
+class ZonaArrastrarSRT(QFrame):
+    def __init__(self, al_seleccionar_archivo_callback):
+        super().__init__()
+        self.callback_archivo = al_seleccionar_archivo_callback
+        self.setFrameShape(QFrame.StyledPanel)
+        self.setFrameShadow(QFrame.Sunken)
+        self.setStyleSheet("""
+            QFrame { border: 2px dashed #e67e22; border-radius: 8px; background-color: #ecf0f1; }
+            QFrame:hover { background-color: #fdf2e9; border: 2px dashed #d35400; }
+        """)
+        self.setMinimumHeight(120)
+        self.setAcceptDrops(True)
+
+        layout = QVBoxLayout()
+        self.label_info = QLabel("Arrastra y suelta tu archivo de TELEMETRÍA aquí\n(.srt)")
+        self.label_info.setAlignment(Qt.AlignCenter)
+        self.label_info.setStyleSheet("color: #7f8c8d; font-size: 13px; font-weight: bold; border: none; background: transparent;")
+        layout.addWidget(self.label_info)
+        self.setLayout(layout)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            urls = event.mimeData().urls()
+            if urls and urls[0].toLocalFile():
+                event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        for url in event.mimeData().urls():
+            ruta_archivo = url.toLocalFile()
+            # CORRECCIÓN: Validación estricta para archivos de subtítulos
+            if ruta_archivo.lower().endswith('.srt'):
+                self.callback_archivo(ruta_archivo)
+                event.acceptProposedAction()
+            else:
+                # CORRECCIÓN: Estilo explícito para visibilidad
+                msg = QMessageBox(QMessageBox.Warning, "Archivo no válido", "Por favor, arrastra un archivo de telemetría válido con extensión .srt", parent=self)
+                msg.setStyleSheet("QLabel{ color: #2c3e50; } QPushButton{ background-color: #dcdde1; color: black; }")
+                msg.exec()
 
 class DroneDashboard(QMainWindow):
     def __init__(self):
@@ -86,12 +114,15 @@ class DroneDashboard(QMainWindow):
         self.resize(1000, 650)
 
         self.video_seleccionado = None
+        self.srt_seleccionado = None
 
-        self.api_url = "http://127.0.0.1:8000"
+        self.api_url_analizador = "http://127.0.0.1:8000"
+        self.api_url_graficador = "http://127.0.0.2:8001"
 
         self.timer_actualizador = QTimer()
         self.timer_actualizador.setInterval(60) # Actualiza a ~16 FPS la GUI
-        self.timer_actualizador.timeout.connect(self.solicitar_actualizacion_servidor)        
+        self.timer_actualizador.timeout.connect(self.solicitar_actualizacion_servidor_analisis) 
+        self.timer_actualizador.timeout.connect(self.solicitar_actualizacion_servidor_grafica)       
 
         # Layout Principal
         self.main_layout = QHBoxLayout()
@@ -131,13 +162,23 @@ class DroneDashboard(QMainWindow):
 
         layout.addWidget(QLabel("Selecciona el video"))
         layout.addSpacing(15)
-        self.zona_drag_drop = ZonaArrastrarVideo(self.actualizar_video_seleccionado)
-        layout.addWidget(self.zona_drag_drop)
+        self.zona_drag_drop_video = ZonaArrastrarVideo(self.actualizar_video_seleccionado)
+        layout.addWidget(self.zona_drag_drop_video)
         layout.addSpacing(15)
 
         self.label_video = QLabel("<b>Video seleccionado:</b> Ninguno (Usa el buscador o arrastra un archivo)")
         self.label_video.setStyleSheet("color: #c0392b; font-size: 13px; padding: 5px; background-color: #fafdff; border: 1px solid #dcdde1;")
         layout.addWidget(self.label_video)
+
+        layout.addSpacing(20)
+
+        self.zona_drag_drop_srt = ZonaArrastrarSRT(self.actualizar_srt_seleccionado)
+        layout.addWidget(self.zona_drag_drop_srt)
+        layout.addSpacing(15)
+
+        self.label_srt = QLabel("<b>SRT seleccionado:</b> Ninguno (Usa el buscador o arrastra un archivo)")
+        self.label_srt.setStyleSheet("color: #c0392b; font-size: 13px; padding: 5px; background-color: #fafdff; border: 1px solid #dcdde1;")
+        layout.addWidget(self.label_srt)
 
         layout.addSpacing(30)
 
@@ -160,6 +201,7 @@ class DroneDashboard(QMainWindow):
 
         grid = QGridLayout()
 
+        # Columna izquierda
         self.main_frame = QLabel("Esperando video")
         self.main_frame.setMaximumSize(420, 230) # 640 360
         # self.main_frame.setStyleSheet("border: 2px solid gray;")
@@ -167,6 +209,14 @@ class DroneDashboard(QMainWindow):
         self.main_frame.setAlignment(Qt.AlignCenter)
         grid.addWidget(self.main_frame, 0, 0, 2, 1)
 
+        self.graph_frame = QLabel("Grafica posicion")
+        self.graph_frame.setMaximumSize(420, 230)
+        # self.graph_frame.setStyleSheet("border: 2px solid gray;")
+        self.graph_frame.setStyleSheet("border: 2px solid #7f8c8d; background-color: #2c3e50; color: white; font-weight: bold;")
+        self.graph_frame.setAlignment(Qt.AlignCenter)
+        grid.addWidget(self.graph_frame, 2, 0, 2, 1)
+
+        # Columna derecha
         self.barcode_frame = QLabel("Codigo de barras")
         self.barcode_frame.setMaximumSize(250, 150)
         # self.barcode_frame.setStyleSheet("border: 2px solid gray;")
@@ -194,13 +244,6 @@ class DroneDashboard(QMainWindow):
         self.datamatrix_frame.setStyleSheet("border: 2px solid #7f8c8d; background-color: #2c3e50; color: white; font-weight: bold;")
         self.datamatrix_frame.setAlignment(Qt.AlignCenter)
         grid.addWidget(self.datamatrix_frame, 3, 1)
-
-        self.label_frame = QLabel("Codigo label")
-        self.label_frame.setMaximumSize(280, 165)
-        # self.label_frame.setStyleSheet("border: 2px solid gray;")
-        self.label_frame.setStyleSheet("border: 2px solid #7f8c8d; background-color: #2c3e50; color: white; font-weight: bold;")
-        self.label_frame.setAlignment(Qt.AlignCenter)
-        grid.addWidget(self.label_frame, 3, 0, 0, 0)
 
         layout.addLayout(grid)
 
@@ -288,6 +331,14 @@ class DroneDashboard(QMainWindow):
         self.label_video.setText(f"<b>Video listo:</b> {nombre_corto}")
         self.label_video.setStyleSheet("color: #27ae60; font-size: 13px; padding: 5px; background-color: #f5fbf7; border: 1px solid #27ae60;")
 
+    def actualizar_srt_seleccionado(self, ruta_archivo):
+        self.srt_seleccionado = ruta_archivo
+        nombre_corto = os.path.basename(ruta_archivo)
+        
+        # Modificar visualización del Label a éxito verde
+        self.label_srt.setText(f"<b>SRT listo:</b> {nombre_corto}")
+        self.label_srt.setStyleSheet("color: #27ae60; font-size: 13px; padding: 5px; background-color: #f5fbf7; border: 1px solid #27ae60;")
+
 
     def iniciar_analisis(self):
         if not self.video_seleccionado:
@@ -296,30 +347,33 @@ class DroneDashboard(QMainWindow):
         
         try:
             # Enviamos la ruta del archivo por HTTP POST a FastAPI
-            respuesta = requests.post(f"{self.api_url}/iniciar", json={"ruta_video": self.video_seleccionado})
-            if respuesta.status_code == 200:
+            res_video = requests.post(f"{self.api_url_analizador}/iniciar", json={"ruta_video": self.video_seleccionado})
+            res_grafo = requests.post(f"{self.api_url_graficador}/iniciar", json={"ruta_waypoint": self.srt_seleccionado})
+            if res_video.status_code == 200 and res_grafo.status_code == 200:
                 self.pages.setCurrentIndex(1)
-                # Arrancar el timer para pedir datos constantemente
                 self.timer_actualizador.start()
             else:
-                QMessageBox.critical(self, "Error Servidor", "El servidor rechazó la solicitud.")
-        except requests.exceptions.ConnectionError:
-            QMessageBox.critical(self, "Servidor Apagado", "Error: Recuerda encender primero 'analisis_server.py' en una terminal.")
-
-    def parar_analisis(self):
-        respuesta = requests.post(f"{self.api_url}/parar")
-        if respuesta.status_code == 200:
-            self.pages.setCurrentIndex(2)
-            self.timer_actualizador.stop()
-
-        else:
-            QMessageBox.critical(self, "Error Servidor", "El servidor rechazó la solicitud.")
+                raise requests.exceptions.RequestException
+        except Exception:
+            msg = QMessageBox(QMessageBox.Critical, "Conexión Fallida", "No se pudo comunicar con los servidores API. Verifica que FastAPI esté corriendo.", parent=self)
+            msg.setStyleSheet("QLabel{ color: #c0392b; }")
+            msg.exec()
 
         
-    def solicitar_actualizacion_servidor(self):
+    def parar_analisis(self):
+        try:
+            requests.post(f"{self.api_url_analizador}/parar")
+            requests.post(f"{self.api_url_graficador}/parar")
+        except Exception as e:
+            print(f"Error al enviar parada: {e}")
+        self.timer_actualizador.stop()
+        self.pages.setCurrentIndex(0)
+
+
+    def solicitar_actualizacion_servidor_analisis(self):
         """Pide el estado de procesamiento por HTTP GET y renderiza los bytes de imágenes"""
         try:
-            res = requests.get(f"{self.api_url}/estado").json()
+            res = requests.get(f"{self.api_url_analizador}/estado").json()
             
             # 1. Pintar textos detectados
             self.barcode_label.setText(res["data_barcode"])
@@ -327,7 +381,7 @@ class DroneDashboard(QMainWindow):
             self.vin_label.setText(res["data_vin"])
             self.datamatrix_label.setText(res["data_datamax"])
 
-            self.tiempo_procesamiento_label.setText(res["data_datamax"])
+            self.tiempo_procesamiento_label.setText(res["data_tiempo_procesamiento"])
             num_frame = res["data_num_frame"]
             num_frame_max = res["data_num_frame_max"]
             progreso = str(f"{num_frame}/{num_frame_max}")
@@ -337,8 +391,8 @@ class DroneDashboard(QMainWindow):
             # 2. Reconvertir e inyectar el video principal (Base64 -> QPixmap)
             if res["frame"]:
                 self.convertir_b64_a_label(res["frame"], self.main_frame)
-            if res["recorte_etiqueta"]:
-                self.convertir_b64_a_label(res["recorte_etiqueta"], self.label_frame)
+            # if res["recorte_etiqueta"]:
+            #     self.convertir_b64_a_label(res["recorte_etiqueta"], self.label_frame)
             if res["recorte_barcode"]:
                 self.convertir_b64_a_label(res["recorte_barcode"], self.barcode_frame)
             if res["recorte_qr"]:
@@ -349,6 +403,22 @@ class DroneDashboard(QMainWindow):
                 self.convertir_b64_a_label(res["recorte_datamax"], self.datamatrix_frame)
 
             # Si el backend avisa que ya acabó, paramos el timer de peticiones
+            if not res["corriendo"] and res["frame_actual_base64"] is not None:
+                self.timer_actualizador.stop()
+                QMessageBox.information(self, "Terminado", "El análisis del video concluyó exitosamente.")
+                
+        except Exception as e:
+            self.timer_actualizador.stop()
+            print(f"Error al conectar con la API: {e}")
+
+    def solicitar_actualizacion_servidor_grafica(self):
+        """Pide el estado de procesamiento por HTTP GET y renderiza los bytes de imágenes"""
+        try:
+            res = requests.get(f"{self.api_url_graficador}/estado").json()
+            
+            if res["grafica"]:
+                self.convertir_b64_a_label(res["grafica"], self.graph_frame)
+
             if not res["corriendo"] and res["frame_actual_base64"] is not None:
                 self.timer_actualizador.stop()
                 QMessageBox.information(self, "Terminado", "El análisis del video concluyó exitosamente.")
