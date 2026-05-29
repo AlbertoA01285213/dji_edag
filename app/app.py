@@ -15,13 +15,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QPushButton, QToolTip,
                              QLabel, QFrame, QGridLayout, QSpinBox, QDoubleSpinBox, QWidget)
 
 import rclpy
-from rclpy.node import Node
-from rclpy.executors import MultiThreadedExecutor
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from sensor_msgs.msg import Image
-from std_msgs.msg import String
-from geometry_msgs.msg import Pose
-from example_interfaces.srv import SetBool
+
 
 class AnalisisSignals(QObject):
     """Clase puente para emitir datos desde el hilo de YOLO hacia la GUI"""
