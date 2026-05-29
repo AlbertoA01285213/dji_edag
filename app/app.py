@@ -6,8 +6,7 @@ import base64
 import sqlite3
 import requests
 import numpy as np
-from cv_bridge import CvBridge
-from sensor_msgs.msg import Image, NavSatFix  # o el tipo que uses para odometría
+
 from PySide6.QtGui import QPixmap, QImage, QPainter, QColor, QPen, QCursor
 from PySide6.QtCore import Signal, QThread, Qt, Slot, QPoint, QObject, QTimer
 from PySide6.QtWidgets import (QApplication, QMainWindow, QPushButton, QToolTip, QComboBox, 
