@@ -3,44 +3,83 @@ import os
 import cv2
 import time
 import sqlite3
+import logging
 import threading
 import numpy as np
 from fastapi import FastAPI, BackgroundTasks
 from pydantic import BaseModel
 from ultralytics import YOLO
 import zxingcpp
+from pylibdmtx.pylibdmtx import decode
+from paddleocr import TextRecognition
 
 app = FastAPI(title="YOLO Video Analyzer Server")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+
+logger = logging.getLogger("Analizador")
 
 # Variables globales para almacenar el estado en tiempo real
 ESTADO_PROCESO = {
     "corriendo": False,
 
-    "data_barcode": "—",
-    "data_qr": "—",
-    "data_vin": "—",
-    "data_datamax": "—",
+    "frame": None,
+
+    "recorte_etiqueta": None,
+
+    "recorte_vin_total": None,
+    "recorte_vin_ult": None,
+    "recorte_datamatrix_link": None,
+    "recorte_datamatrix_num": None,
+    "recorte_pkn_largo": None,
+    "recorte_cve_com": None,
+    "recorte_vin_barra": None,
+
+    "vin_ult_data": "—",
+    "datamatrix_link_data": "—",
+    "datamatrix_num_data": "—",
+    "pkn_largo_data": "—",
+    "cve_com_data": "—",
+    "vin_barra_data": "—",
 
     "data_tiempo_procesamiento": "—",
     "data_num_frame": "—",
     "data_num_frame_max": "—",
 
     "formato": "—",
-    "texto": "Esperando scanner...",
-
-    "frame": None,
-    "recorte_etiqueta": None,
-    "recorte_barcode": None,
-    "recorte_qr": None,
-    "recorte_vin": None,
-    "recorte_datamax": None
+    "texto": "Esperando scanner..."
 }
+
+MODEL = TextRecognition(model_name="PP-OCRv5_server_rec")
+
+conn = sqlite3.connect("datos.db")
+cursor = conn.cursor()
+cursor.execute("""
+               CREATE TABLE IF NOT EXISTS etiquetas (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               vin_barra TEXT,
+               vin_ult TEXT,
+               datamatrix_link TEXT,
+               datamatrix_num TEXT,
+               pkn_largo TEXT,
+               cve_com TEXT,
+               latitud TEXT,
+               longitud TEXT,
+               fecha_registro TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+               )
+               """)
+conn.commit()
+conn.close()
 
 DEBE_PARAR = False
 CONFIDENCE_THRESHOLD = 0.8
 
 # Configuraciones de rutas fijas de tu proyecto
-PATH_BASE = os.path.join(os.path.expanduser('~'), 'Documents', 'dji_edag', 'reconocimiento')
+PATH_BASE = os.path.join(os.path.expanduser('~'), 'Documents', 'dji_edag', 'app')
 PATH_MODELO_ETIQUETA = os.path.join(PATH_BASE, 'modelos', 'modelo_etiqueta.pt')
 PATH_MODELO_CODIGOS = os.path.join(PATH_BASE, 'modelos', 'modelo_codigos.pt')
 PATH_OUTPUT = os.path.join(PATH_BASE, 'output')
@@ -49,11 +88,6 @@ PATH_OUTPUT = os.path.join(PATH_BASE, 'output')
 print("Cargando modelos YOLO en el Servidor...")
 modelo_etiqueta = YOLO(PATH_MODELO_ETIQUETA)
 modelo_codigos = YOLO(PATH_MODELO_CODIGOS)
-
-data_barcode_anterior = "---"
-data_qr_anterior = "---"
-data_vin_anterior = "---"
-data_datamax_anterior = "---"
 
 
 class VideoPayload(BaseModel):
@@ -75,9 +109,17 @@ def optimizar_y_convertir_base64(img, max_width=640):
 
 def analizar_imagen(img, modelo, usar_tracking=False, frame_num=0):
     """Ejecuta YOLO (con soporte opcional para ByteTrack) y devuelve un diccionario limpio"""
+    # if usar_tracking:
+    #     persistir = True if frame_num % 3 == 0 else False
+    #     results = modelo.track(source=img, persist=persistir, tracker="bytetrack.yaml", verbose=False)[0]
     if usar_tracking:
-        persistir = True if frame_num % 3 == 0 else False
-        results = modelo.track(source=img, persist=persistir, tracker="bytetrack.yaml", verbose=False)[0]
+        # CORRECCIÓN: 'persist' DEBE ser siempre True en un flujo de video continuo
+        results = modelo.track(
+            source=img, 
+            persist=True, 
+            tracker="bytetrack.yaml", 
+            verbose=False
+        )[0]
     else:
         results = modelo(img, verbose=False)[0]
 
@@ -95,8 +137,14 @@ def analizar_imagen(img, modelo, usar_tracking=False, frame_num=0):
         label = modelo.names[int(box.cls[0])]
         
         # Recuperar el track_id si el tracker está activo
-        track_id = int(results.boxes.id[i].item()) if (results.boxes.id is not None) else None
-
+        # track_id = int(results.boxes.id[i].item()) if (results.boxes.id is not None) else None
+        track_id = None
+        if usar_tracking and results.boxes.id is not None:
+            try:
+                track_id = int(results.boxes.id[i].item())
+            except Exception:
+                track_id = None
+                
         x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
         w, h = x2 - x1, y2 - y1
         cx = int(x1 + w / 2)
@@ -178,23 +226,149 @@ def recortar_frame(img, bbox):
     x1, y1 = max(0, x), max(0, y)
     x2, y2 = min(img.shape[1], x + w), min(img.shape[0], y + h)
     return img[y1:y2, x1:x2]
-                
 
+def guardar_etiqueta_en_db(datos):
+    """Inserta de forma segura un registro consolidado en la BD aislando la conexión por hilo"""
+    # Evitamos guardar registros completamente vacíos que no aporten información limpia
+    if all(v == "—" for v in datos.values()):
+        return
+
+    try:
+        conn = sqlite3.connect("datos.db")
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO etiquetas (vin_barra, vin_ult, datamatrix_link, datamatrix_num, pkn_largo, cve_com)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            datos["vin_barra_data"] if datos["vin_barra_data"] != "—" else None,
+            datos["vin_ult_data"] if datos["vin_ult_data"] != "—" else None,
+            datos["datamatrix_link_data"] if datos["datamatrix_link_data"] != "—" else None,
+            datos["datamatrix_num_data"] if datos["datamatrix_num_data"] != "—" else None,
+            datos["pkn_largo_data"] if datos["pkn_largo_data"] != "—" else None,
+            datos["cve_com_data"] if datos["cve_com_data"] != "—" else None
+        ))
+        conn.commit()
+        conn.close()
+        logger.info("--> [DB SUCCESS] Se ha guardado una nueva etiqueta física en la Base de Datos.")
+    except Exception as e:
+        logger.error(f"Error crítico al intentar escribir en SQLite: {e}")
+
+def ordenar_puntos(pts):
+    """Ordena 4 puntos en orden estricto: [Top-Left, Top-Right, Bottom-Right, Bottom-Left]"""
+    pts = pts.reshape(4, 2)
+    nuevo_orden = np.zeros((4, 2), dtype=np.float32)
+    
+    # Top-Left tiene la suma mínima, Bottom-Right la suma máxima
+    suma = pts.sum(axis=1)
+    nuevo_orden[0] = pts[np.argmin(suma)]
+    nuevo_orden[2] = pts[np.argmax(suma)]
+    
+    # Top-Right tiene la diferencia (y - x) mínima, Bottom-Left la máxima
+    dif = np.diff(pts, axis=1).flatten()
+    nuevo_orden[1] = pts[np.argmin(dif)]
+    nuevo_orden[3] = pts[np.argmax(dif)]
+
+    return nuevo_orden
+
+def rectificar(img):
+    """
+    Detecta la inclinación de un código y lo rota para enderezarlo 
+    SIN recortarlo, expandiendo el lienzo y manteniendo un fondo blanco.
+    """
+    if img is None or img.size == 0:
+        return img, False, None
+
+    h, w = img.shape[:2]
+    img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(img_gray, (5, 5), 0)
+
+    edges = cv2.Canny(blur, 30, 100)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    edges = cv2.dilate(edges, kernel, iterations=1)
+
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return img, False, None
+    
+    area_min = h * w * 0.10
+    candidatos = [c for c in contours if cv2.contourArea(c) > area_min]
+    if not candidatos:
+        return img, False, None
+
+    mayor = max(candidatos, key=cv2.contourArea)
+    peri = cv2.arcLength(mayor, True)
+    approx = cv2.approxPolyDP(mayor, 0.02 * peri, True)
+
+    if len(approx) == 4:
+        pts = ordenar_puntos(approx)
+    else:
+        rect = cv2.minAreaRect(mayor)
+        box = cv2.boxPoints(rect)
+        pts = ordenar_puntos(box)
+
+    # Extraemos los puntos superiores para calcular la pendiente de la línea
+    tl, tr, br, bl = pts
+
+    # Calcular el ángulo exacto en grados usando arcotangente (delta_y / delta_x)
+    angle = np.degrees(np.arctan2(tr[1] - tl[1], tr[0] - tl[0]))
+
+    # Si la imagen ya está prácticamente derecha (menos de 0.5 grados), no gastamos CPU
+    if abs(angle) < 0.5:
+        return img, True, pts.astype(int)
+
+    # --- NUEVA ESTRATEGIA: ROTACIÓN SIN PÉRDIDA ---
+    # 1. Obtener el centro original del recorte de YOLO
+    cX, cY = w // 2, h // 2
+    
+    # 2. Generar la matriz de rotación en 2D basada en el ángulo detectado
+    M = cv2.getRotationMatrix2D((cX, cY), angle, 1.0)
+    
+    # 3. Calcular el valor absoluto de los senos y cosenos para redimensionar el lienzo
+    cos = np.abs(M[0, 0])
+    sin = np.abs(M[0, 1])
+    
+    # Nueva anchura y altura matemática para que quepa la imagen rotada completa sin cortes
+    nW = int((h * sin) + (w * cos))
+    nH = int((h * cos) + (w * sin))
+    
+    # 4. Modificar la matriz de traslación para mover el nuevo centro al lienzo expandido
+    M[0, 2] += (nW / 2) - cX
+    M[1, 2] += (nH / 2) - cY
+    
+    # 5. Ejecutar el giro usando interpolación cúbica (conserva mejor la definición de las barras)
+    # IMPORTANTE: borderValue=(255, 255, 255) genera márgenes blancos en lugar de negros
+    warped = cv2.warpAffine(
+        img, 
+        M, 
+        (nW, nH), 
+        flags=cv2.INTER_CUBIC, 
+        borderMode=cv2.BORDER_CONSTANT, 
+        borderValue=(255, 255, 255)
+    )
+
+    return warped, True, pts.astype(int)
+
+        
 def bucle_vision_artificial(video_path):
     """Tu script original de procesamiento de video adaptado a la API"""
     global ESTADO_PROCESO, DEBE_PARAR
     ESTADO_PROCESO["corriendo"] = True
+    DEBE_PARAR = False
     
     etiquetas_procesadas = set()
     cap = cv2.VideoCapture(video_path)
     frame_num = 0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
+    id_etiqueta_actual = None
+
     ultimos_datos = {
-        "barcode": "—",
-        "qr": "—",
-        "vin": "—",
-        "datamax": "—"
+        "vin_ult_data": "—",
+        "datamatrix_link_data": "—",
+        "datamatrix_num_data": "—",
+        "pkn_largo_data": "—",
+        "cve_com_data": "—",
+        "vin_barra_data": "—"
     }
 
     frame_null = np.zeros((280, 280, 3), dtype=np.uint8)
@@ -208,10 +382,12 @@ def bucle_vision_artificial(video_path):
             break
         frame_num += 1
 
-        data_barcode = ultimos_datos["barcode"]
-        data_qr = ultimos_datos["qr"]
-        data_vin = ultimos_datos["vin"]
-        data_datamax = ultimos_datos["datamax"]
+        data_vin_ult = ultimos_datos["vin_ult_data"]
+        data_datamatrix_link = ultimos_datos["datamatrix_link_data"]
+        data_datamatrix_num = ultimos_datos["datamatrix_num_data"]
+        data_pkn_largo = ultimos_datos["pkn_largo_data"]
+        data_cve_com = ultimos_datos["cve_com_data"]
+        data_vin_barra = ultimos_datos["vin_barra_data"]
 
         t_init = time.time()
 
@@ -220,6 +396,13 @@ def bucle_vision_artificial(video_path):
         lista_etiquetas = extraer_todas_las_detecciones(data_img_analizada)
 
         if not lista_etiquetas:
+            if id_etiqueta_actual is not None:
+                guardar_etiqueta_en_db(ultimos_datos)
+                id_etiqueta_actual = None
+                ultimos_datos = {k: "—" for k in ultimos_datos}
+
+            t_fin = time.time() - t_init
+
             ESTADO_PROCESO["frame"] = optimizar_y_convertir_base64(frame, 640)
             ESTADO_PROCESO["recorte_etiqueta"] = frame_null
             ESTADO_PROCESO["recorte_barcode"] = frame_null
@@ -227,12 +410,14 @@ def bucle_vision_artificial(video_path):
             ESTADO_PROCESO["recorte_vin"] = frame_null
             ESTADO_PROCESO["recorte_datamax"] = frame_null
 
-            ESTADO_PROCESO["data_barcode"] = data_barcode
-            ESTADO_PROCESO["data_qr"] = data_qr
-            ESTADO_PROCESO["data_vin"] = data_vin
-            ESTADO_PROCESO["data_datamax"] = data_datamax
+            ESTADO_PROCESO["vin_ult_data"] = data_vin_ult
+            ESTADO_PROCESO["datamatrix_link_data"] = data_datamatrix_link
+            ESTADO_PROCESO["datamatrix_num_data"] = data_datamatrix_num
+            ESTADO_PROCESO["pkn_largo_data"] = data_pkn_largo
+            ESTADO_PROCESO["cve_com_data"] = data_cve_com
+            ESTADO_PROCESO["vin_barra_data"] = data_vin_barra
 
-            ESTADO_PROCESO["data_tiempo_procesamiento"] = "---"
+            ESTADO_PROCESO["data_tiempo_procesamiento"] = f"{round(t_fin * 1000, 1)} ms"
             ESTADO_PROCESO["data_num_frame"] = int(frame_num)
             ESTADO_PROCESO["data_num_frame_max"] = int(total_frames)
             continue
@@ -247,66 +432,116 @@ def bucle_vision_artificial(video_path):
 
         data_codigos_analizados = analizar_imagen(img_etiqueta, modelo_codigos)
 
-        barcode_det = obtener_mejor_deteccion(data_codigos_analizados, 'VIN')
-        qr_det = obtener_mejor_deteccion(data_codigos_analizados, 'PKN_Largo')
-        vin_det = obtener_mejor_deteccion(data_codigos_analizados, 'CVE_COM')
-        datamax_det = obtener_mejor_deteccion(data_codigos_analizados, 'DATAMATRIX_NUM')
+        vin_total_det = obtener_mejor_deteccion(data_codigos_analizados, 'VIN_TOTAL')
+        vin_ult_det =  obtener_mejor_deteccion(data_codigos_analizados, 'VIN_ULT')
+        datamatrix_link_det = obtener_mejor_deteccion(data_codigos_analizados, 'DATAMATRIX_LINK')
+        datamatrix_num_det = obtener_mejor_deteccion(data_codigos_analizados, 'DATAMATRIX_NUM')
+        pkn_largo_det = obtener_mejor_deteccion(data_codigos_analizados, 'PKN_LARGO')
+        cve_com_det = obtener_mejor_deteccion(data_codigos_analizados, 'CVE_COM')
+        vin_barra_det = obtener_mejor_deteccion(data_codigos_analizados, 'VIN_BARRA')
 
-        img_barcode_b64, img_qr_b64, img_vin_b64, img_datamax_b64 = None, None, None, None
+        
+        img_vin_total_b64, img_vin_ult_b64, img_datamatrix_link_b64 = None, None, None
+        img_datamatrix_num_b64, img_pkn_largo_b64, img_cve_com_b64, img_vin_barra_b64 = None, None, None, None
 
-        if barcode_det:
-            crop = recortar_frame(img_etiqueta, barcode_det['bbox'])
-            img_barcode_b64 = optimizar_y_convertir_base64(crop, 280)
-            scan = zxingcpp.read_barcode(crop)
-            if scan and scan.text: 
-                data_barcode = scan.text
-                ultimos_datos["barcode"] = scan.text
+        if vin_total_det:
+            crop = recortar_frame(img_etiqueta, vin_total_det['bbox'])
+            img_vin_total_b64 = optimizar_y_convertir_base64(crop, 280)
 
-        if qr_det:
-            crop = recortar_frame(img_etiqueta, qr_det['bbox'])
-            img_qr_b64 = optimizar_y_convertir_base64(crop, 280)
-            scan = zxingcpp.read_barcode(crop)
-            if scan and scan.text: 
-                data_qr = scan.text
-                ultimos_datos["qr"] = scan.text
 
-        if vin_det:
-            crop = recortar_frame(img_etiqueta, vin_det['bbox'])
-            img_vin_b64 = optimizar_y_convertir_base64(crop, 280)
-            scan = zxingcpp.read_barcode(crop)
-            if scan and scan.text: 
-                data_vin = scan.text
-                ultimos_datos["vin"] = scan.text
+        if vin_ult_det and (frame_num % 5 == 0 or ultimos_datos["vin_ult_data"] == "—"):
+            try:
+                crop_vin_ult = recortar_frame(img_etiqueta, vin_ult_det['bbox'])
+                img_vin_ult_b64 = optimizar_y_convertir_base64(crop_vin_ult, 280)
+                scan_vin_ult = MODEL.predict(input=crop_vin_ult)
+                if scan_vin_ult:
+                    for res in scan_vin_ult:
+                        if isinstance(res, dict) and "rec_text" in res and res["rec_text"]:
+                            scan_vin_ult_txt = res["rec_text"].strip().upper()
+                            if scan_vin_ult_txt:
+                                data_vin_ult = scan_vin_ult_txt
+                                ultimos_datos["vin_ult_data"] = scan_vin_ult_txt
+            except Exception as e:
+                logger.error(f"Error en PaddleOCR: {e}")
 
-        if datamax_det:
-            crop = recortar_frame(img_etiqueta, datamax_det['bbox'])
-            img_datamax_b64 = optimizar_y_convertir_base64(crop, 280)
-            scan = zxingcpp.read_barcode(crop)
-            if scan and scan.text: 
-                data_datamax = scan.text
-                ultimos_datos["datamax"] = scan.text
+        if datamatrix_link_det:
+            crop_datamatrix_link = recortar_frame(img_etiqueta, datamatrix_link_det['bbox'])
+            crop_datamatrix_link, _, _ = rectificar(crop_datamatrix_link)
+            img_datamatrix_link_b64 = optimizar_y_convertir_base64(crop_datamatrix_link, 280)
+            scan_datamatrix_link = zxingcpp.read_barcode(crop_datamatrix_link)
+            if scan_datamatrix_link and scan_datamatrix_link.text: 
+                data_datamatrix_link = scan_datamatrix_link.text
+                ultimos_datos["datamatrix_link_data"] = scan_datamatrix_link.text
+
+
+        if datamatrix_num_det:
+            crop_datamatrix_num = recortar_frame(img_etiqueta, datamatrix_num_det['bbox'])
+            crop_datamatrix_num, _, _ = rectificar(crop_datamatrix_num)
+            img_datamatrix_num_b64 = optimizar_y_convertir_base64(crop_datamatrix_num, 280)
+            scan_datamatrix_num = zxingcpp.read_barcode(crop_datamatrix_num)
+            if scan_datamatrix_num and scan_datamatrix_num.text: 
+                data_datamatrix_num = scan_datamatrix_num.text
+                ultimos_datos["datamatrix_num_data"] = scan_datamatrix_num.text
+
+
+        if pkn_largo_det:
+            crop_pkn_largo = recortar_frame(img_etiqueta, pkn_largo_det['bbox'])
+            crop_pkn_largo, _, _ = rectificar(crop_pkn_largo)
+            img_pkn_largo_b64 = optimizar_y_convertir_base64(crop_pkn_largo, 280)
+            scan_pkn_largo = zxingcpp.read_barcode(crop_pkn_largo)
+            if scan_pkn_largo and scan_pkn_largo.text: 
+                data_pkn_largo = scan_pkn_largo.text
+                ultimos_datos["pkn_largo_data"] = scan_pkn_largo.text
+
+        if cve_com_det:
+            crop_cve_com = recortar_frame(img_etiqueta, cve_com_det['bbox'])
+            crop_cve_com, _, _ = rectificar(crop_cve_com)
+            img_cve_com_b64 = optimizar_y_convertir_base64(crop_cve_com, 280)
+            scan_cve_com = zxingcpp.read_barcode(crop_cve_com)
+            if scan_cve_com and scan_cve_com.text: 
+                data_cve_com = scan_cve_com.text
+                ultimos_datos["cve_com_data"] = scan_cve_com.text
+
+        if vin_barra_det:
+            crop_vin_barra = recortar_frame(img_etiqueta, vin_barra_det['bbox'])
+            crop_vin_barra, _, _ = rectificar(crop_vin_barra)
+            img_vin_barra_b64 = optimizar_y_convertir_base64(crop_vin_barra, 280)
+            scan_vin_barra = zxingcpp.read_barcode(crop_vin_barra)
+            if scan_vin_barra and scan_vin_barra.text: 
+                data_vin_barra = scan_vin_barra.text
+                ultimos_datos["vin_barra_data"] = scan_vin_barra.text
 
         t_fin = time.time() - t_init
 
         ESTADO_PROCESO["frame"] = optimizar_y_convertir_base64(frame, 640)
         ESTADO_PROCESO["recorte_etiqueta"] = optimizar_y_convertir_base64(frame_etiqueta, 280)
-        ESTADO_PROCESO["recorte_barcode"] = img_barcode_b64
-        ESTADO_PROCESO["recorte_qr"] = img_qr_b64
-        ESTADO_PROCESO["recorte_vin"] = img_vin_b64
-        ESTADO_PROCESO["recorte_datamax"] = img_datamax_b64
 
-        ESTADO_PROCESO["data_barcode"] = data_barcode
-        ESTADO_PROCESO["data_qr"] = data_qr
-        ESTADO_PROCESO["data_vin"] = data_vin
-        ESTADO_PROCESO["data_datamax"] = data_datamax
+        ESTADO_PROCESO["recorte_vin_total"] = img_vin_total_b64
+        ESTADO_PROCESO["recorte_vin_ult"] = img_vin_ult_b64
+        ESTADO_PROCESO["recorte_datamatrix_link"] = img_datamatrix_link_b64
+        ESTADO_PROCESO["recorte_datamatrix_num"] = img_datamatrix_num_b64
+        ESTADO_PROCESO["recorte_pkn_largo"] = img_pkn_largo_b64
+        ESTADO_PROCESO["recorte_cve_com"] = img_cve_com_b64
+        ESTADO_PROCESO["recorte_vin_barra"] = img_vin_barra_b64
+
+        ESTADO_PROCESO["vin_ult_data"] = data_vin_ult
+        ESTADO_PROCESO["datamatrix_link_data"] = data_datamatrix_link
+        ESTADO_PROCESO["datamatrix_num_data"] = data_datamatrix_num
+        ESTADO_PROCESO["pkn_largo_data"] = data_pkn_largo
+        ESTADO_PROCESO["cve_com_data"] = data_cve_com
+        ESTADO_PROCESO["vin_barra_data"] = data_vin_barra
+
 
         ESTADO_PROCESO["data_tiempo_procesamiento"] = f"{round(t_fin * 1000, 1)} ms"
         ESTADO_PROCESO["data_num_frame"] = int(frame_num)
         ESTADO_PROCESO["data_num_frame_max"] = int(total_frames)
+
+        guardar_etiqueta_en_db(ultimos_datos)
         
 
     cap.release()
     ESTADO_PROCESO["corriendo"] = False
+    frame_num = 0
     print("Análisis de video terminado.")
 
 @app.post("/iniciar")
