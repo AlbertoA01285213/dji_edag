@@ -8,22 +8,33 @@ Una vez conseguido el video y el archivo de telemetria, estos se meten en la apl
 *Insertar gif de la aplicacion analizando* 
 
 ## Como funciona
-El programa se basa en 1 codigo principal el cual es el analizador. Este es el encargado de recibir cada imagen del video, analizarla y dar los resultados. El scipt agarra la primera foto. Usando YOLO la analiza foto en busqueda de la etiqueta. Una vez encontrada la etiquta, la recorta y ese recorte lo vuelve a analizar con YOLO para buscar los codigos de barra y recorta cada uno de los codigos encontrados. Utilizando zxingcpp se analiza cada codigo para obtener su informacion.
-A la vez, esta corriendo el codigo del dashboard. El dashboard funciona como el cliente. Este le indica al analizador el request de datos. El analziador recibe el request y le manda los datos y las imagenes. Posteriormente el dashboard recibe los datos y los muestra.
-EL codigo del graficador es meramente estetico. Este se encarga de leer el archivo de la telemetria, del archivo obtiene los datos de posicion del dron. Luego, utiliza esos datos para generar un path visual del dron y utiliza la informacion del frame del video para sincronizar y crear una animacion de la ruta del dron conforme analiza las imagenes.
+El programa se basa en 1 codigo principal el cual es el analizador. Este es el encargado de recibir cada imagen del video, analizarla y dar los resultados. El script agarra la primera foto. Usando YOLO, analiza la foto en busqueda de la etiqueta. Una vez encontrada la etiqueta, se realiza el recorte y vuelve a analizar con YOLO para buscar las diferentes secciones de la etiqueta. Utilizando zxingcpp se analizan los Code39 y Datamatrix y con PaddleOCR se analiza los últimos dígitos del VIN.
+
+A la vez, esta corriendo el codigo del dashboard. El dashboard funciona como el cliente. Este le indica al analizador el request de datos. El analizador recibe el request y le manda los datos y las imagenes. Posteriormente el dashboard recibe los datos y los muestra.
+El código del graficador es meramente estético. Este se encarga de leer el archivo de la telemetría, del archivo obtiene los datos de posición del dron. Luego, utiliza esos datos para generar un path visual del dron y utiliza la información del frame del video para sincronizar y crear una animación de la ruta del dron conforme analiza las imagenes.
 
 ## Como correrlo
-Para correr el repositorio, primero debes de clonarlo.
+Para correr el repositorio, primero se necesita clonar.
 
 ```
 git clone ...
 ```
 
 Tambien ocuparas las librerias
-- pyside
+- PySide6
+- requests
+- folium
+- opencv-python
+- numpy
+- ultralytics
+- zxing-cpp
+- pylibdtmx
+- paddleocr
+- fastapi
 - uvicorn
-- fast api
-- no se que mas
+- matplotlib
+
+Las librerías se encuentran en requirements.txt.
 
 Correrlo es sencillo. En la primera terminal corres la aplicacion.
 ```
