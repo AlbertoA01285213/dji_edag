@@ -1,9 +1,6 @@
-# dji_edag
+# DJI_EDAG
  
-alberto@Alberto:~/Documents/dji_edag/slam/video_2$ ffmpeg -i video.mp4 -f image2 ~/Documents/dji_edag/slam/video_2/%05d.png
+En este repositorio, se encuentra los archivos principales para correr la aplicación de detección de códigos en un vehículo.
 
-
-cd ~/Documents/dji_edag/slam/video
-ls frame_*.png | awk '{print NR*0.0333, $1}' > rgb.txt
-
-./Examples/Monocular/mono_tum   Vocabulary/ORBvoc.txt   Examples/Monocular/laptop.yaml   /home/alberto/Documents/dji_edag/slam/video_2
+En la carpeta app, se tienen los archivos app.py, analizador.py y graficador.py para ejecutar la aplicación.
+En la carpeta src, se encuentran los diferentes programas para debuggear los archivos en la app.
