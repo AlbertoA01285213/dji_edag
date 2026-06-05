@@ -2,9 +2,11 @@
 import os
 import sys
 import cv2
+import json
 import base64
 import sqlite3
 import requests
+import folium
 import numpy as np
 
 from PySide6.QtGui import QPixmap, QImage, QPainter, QColor, QPen, QCursor
@@ -12,8 +14,7 @@ from PySide6.QtCore import Signal, QThread, Qt, Slot, QPoint, QObject, QTimer
 from PySide6.QtWidgets import (QApplication, QMainWindow, QPushButton, QToolTip, QComboBox, 
                              QVBoxLayout, QHBoxLayout, QWidget, QStackedWidget, QMessageBox,
                              QLabel, QFrame, QGridLayout, QSpinBox, QDoubleSpinBox, QWidget)
-
-import rclpy
+from PySide6.QtWebEngineWidgets import QWebEngineView
 
 
 class AnalisisSignals(QObject):
@@ -99,6 +100,101 @@ class ZonaArrastrarSRT(QFrame):
                 msg.setStyleSheet("QLabel{ color: #2c3e50; } QPushButton{ background-color: #dcdde1; color: black; }")
                 msg.exec()
 
+class MapaDashboard(QFrame):
+    def __init__(self):
+        super().__init__()
+        self.setFrameShape(QFrame.StyledPanel)
+        self.setFrameShadow(QFrame.Sunken)
+        self.setMinimumHeight(500)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self.vista_web = QWebEngineView()
+        layout.addWidget(self.vista_web)
+
+        self.cargar_mapa()
+
+    def cargar_mapa(self):
+        data = self.obtener_data_db()
+
+        if not data:
+            lat_inicial, lon_inicial, = 25.584, -100.266
+        else:
+            lat_inicial = data[0]['lat']
+            lon_inicial = data[0]['lon']
+
+        mapa = folium.Map(location=[lat_inicial, lon_inicial], zoom_start=17, tiles="CartoDB dark_matter")
+
+        
+        for et in data:
+            # html_info = f"""
+            # <div style="font-family: Arial; color: #white; background-color: #2c3e50; padding: 10px; border-radius: 5px;">
+            #     <b>VIN_ULT:</b> {et['vin_ult']}<br>
+            #     <b>DM_LINK:</b> {et['datamatrix_link']}<br>
+            #     <b>DM_NUM:</b> {et['datamatrix_num']}<br>
+            #     <b>PKN_LA:</b> {et['pkn_largo']}<br>
+            #     <b>CVE_COM:</b> {et['cve_com']}<br>
+            # </div>
+            # """
+
+            html_info = f"""
+            <div style="font-family: 'Segoe UI', Arial; color: white; background-color: #2c3e50; padding: 12px; border-radius: 6px; min-width: 200px; box-shadow: 2px 2px 10px rgba(0,0,0,0.5);">
+                <span style="color: #1abc9c; font-weight: bold; font-size: 14px;">Etiqueta Detectada</span><hr style="border: 0; border-top: 1px solid #7f8c8d; margin: 6px 0;">
+                <b>VIN (Últ):</b> {et['vin_ult']}<br>
+                <b>DM Link:</b> <span style="font-size: 11px; color: #3498db;">{et['datamatrix_link']}</span><br>
+                <b>DM Núm:</b> {et['datamatrix_num']}<br>
+                <b>PKN Largo:</b> {et['pkn_largo']}<br>
+                <b>CVE COM:</b> <span style="background-color: #e67e22; padding: 2px 5px; border-radius: 3px; font-size: 11px;">{et['cve_com']}</span>
+            </div>
+            """
+
+            folium.CircleMarker(
+                location=[et["lat"], et["lon"]],
+                radius=8,
+                color="#1abc9c",
+                fill=True,
+                fill_color="#1abc9c",
+                tooltip=folium.Tooltip(html_info, sticky=True)
+            ).add_to(mapa)
+
+        html_puro = mapa._repr_html_()
+        self.vista_web.setHtml(html_puro)
+
+
+    def obtener_data_db(self):
+        detecciones = []
+        if not os.path.exists("datos.db"):
+            return detecciones
+
+        try:
+            conn = sqlite3.connect("datos.db")
+            cursor = conn.cursor()
+            # Validamos que la tabla exista antes de intentar consultar para prevenir fallos en la UI
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='etiquetas_procesadas'")
+            if not cursor.fetchone():
+                conn.close()
+                return detecciones
+
+            cursor.execute("SELECT id, vin_ult, datamatrix_link, datamatrix_num, pkn_largo, cve_com, latitud, longitud FROM etiquetas_procesadas")
+            rows = cursor.fetchall()
+            for r in rows:
+                detecciones.append({
+                    "id": r[0],
+                    "vin_ult": r[1],
+                    "datamatrix_link": r[2], # Corregido: Se añade la 'r' faltante
+                    "datamatrix_num": r[3],
+                    "pkn_largo": r[4],
+                    "cve_com": r[5],
+                    "lat": float(r[6]) if r[6] else 0.0,
+                    "lon": float(r[7]) if r[7] else 0.0
+                })
+            conn.close()
+        except Exception as e:
+            print(f"Error crítico leyendo DB desde el Dashboard: {e}")
+        return detecciones
+
+
 class DroneDashboard(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -111,6 +207,7 @@ class DroneDashboard(QMainWindow):
 
         self.api_url_analizador = "http://127.0.0.1:8000"
         self.api_url_graficador = "http://127.0.0.2:8001"
+        self.api_url_procesador = "http://127.0.0.3:8002"
 
         self.timer_actualizador = QTimer()
         self.timer_actualizador.setInterval(60) # Actualiza a ~16 FPS la GUI
@@ -142,7 +239,8 @@ class DroneDashboard(QMainWindow):
         self.init_pages()
 
         self.btn_analisis.clicked.connect(lambda: self.pages.setCurrentIndex(0))
-        self.btn_resultados.clicked.connect(lambda: self.pages.setCurrentIndex(2))
+        # self.btn_resultados.clicked.connect(lambda: self.pages.setCurrentIndex(2))
+        self.btn_resultados.clicked.connect(self.cambiar_a_pagina_resultados)
 
     
     def init_pages(self):
@@ -192,7 +290,7 @@ class DroneDashboard(QMainWindow):
         layout = QVBoxLayout()
         layout.addWidget(QLabel("<h2>Analisis</h2>"))
 
-        grid = QGridLayout()
+        grid_frames = QGridLayout()
 
         # Columna izquierda
         self.main_frame = QLabel("Esperando video")
@@ -200,71 +298,114 @@ class DroneDashboard(QMainWindow):
         # self.main_frame.setStyleSheet("border: 2px solid gray;")
         self.main_frame.setStyleSheet("border: 2px solid #7f8c8d; background-color: #2c3e50; color: white; font-weight: bold;")
         self.main_frame.setAlignment(Qt.AlignCenter)
-        grid.addWidget(self.main_frame, 0, 0, 2, 1)
+        grid_frames.addWidget(self.main_frame, 0, 0, 2, 1)
 
         self.graph_frame = QLabel("Grafica posicion")
         self.graph_frame.setMaximumSize(420, 230)
         # self.graph_frame.setStyleSheet("border: 2px solid gray;")
         self.graph_frame.setStyleSheet("border: 2px solid #7f8c8d; background-color: #2c3e50; color: white; font-weight: bold;")
         self.graph_frame.setAlignment(Qt.AlignCenter)
-        grid.addWidget(self.graph_frame, 2, 0, 2, 1)
+        grid_frames.addWidget(self.graph_frame, 2, 0, 2, 1)
 
         # Columna derecha
-        self.barcode_frame = QLabel("Codigo de barras")
-        self.barcode_frame.setMaximumSize(250, 150)
-        # self.barcode_frame.setStyleSheet("border: 2px solid gray;")
-        self.barcode_frame.setStyleSheet("border: 2px solid #7f8c8d; background-color: #2c3e50; color: white; font-weight: bold;")
-        self.barcode_frame.setAlignment(Qt.AlignCenter)
-        grid.addWidget(self.barcode_frame, 0, 1)
+        self.vin_ult_frame = QLabel("Codigo de vin_ult")
+        self.vin_ult_frame.setMaximumSize(250, 150)
+        # self.vin_ult_frame.setStyleSheet("border: 2px solid gray;")
+        self.vin_ult_frame.setStyleSheet("border: 2px solid #7f8c8d; background-color: #2c3e50; color: white; font-weight: bold;")
+        self.vin_ult_frame.setAlignment(Qt.AlignCenter)
+        grid_frames.addWidget(self.vin_ult_frame, 0, 1)
 
-        self.qrcode_frame = QLabel("Codigo QR")
-        self.qrcode_frame.setMaximumSize(250, 150)
-        # self.qrcode_frame.setStyleSheet("border: 2px solid gray;")
-        self.qrcode_frame.setStyleSheet("border: 2px solid #7f8c8d; background-color: #2c3e50; color: white; font-weight: bold;")
-        self.qrcode_frame.setAlignment(Qt.AlignCenter)
-        grid.addWidget(self.qrcode_frame, 1, 1)
+        self.datamatrix_link_frame = QLabel("Codigo datamatrix link")
+        self.datamatrix_link_frame.setMaximumSize(250, 150)
+        # self.datamatrix_link_frame.setStyleSheet("border: 2px solid gray;")
+        self.datamatrix_link_frame.setStyleSheet("border: 2px solid #7f8c8d; background-color: #2c3e50; color: white; font-weight: bold;")
+        self.datamatrix_link_frame.setAlignment(Qt.AlignCenter)
+        grid_frames.addWidget(self.datamatrix_link_frame, 1, 1)
 
-        self.vin_frame = QLabel("Codigo VIN")
-        self.vin_frame.setMaximumSize(250, 150)
-        # self.vin_frame.setStyleSheet("border: 2px solid gray;")
-        self.vin_frame.setStyleSheet("border: 2px solid #7f8c8d; background-color: #2c3e50; color: white; font-weight: bold;")
-        self.vin_frame.setAlignment(Qt.AlignCenter)
-        grid.addWidget(self.vin_frame, 2, 1)
+        self.datamatrix_num_frame = QLabel("Codigo datamatrix num")
+        self.datamatrix_num_frame.setMaximumSize(250, 150)
+        # self.datamatrix_num_frame.setStyleSheet("border: 2px solid gray;")
+        self.datamatrix_num_frame.setStyleSheet("border: 2px solid #7f8c8d; background-color: #2c3e50; color: white; font-weight: bold;")
+        self.datamatrix_num_frame.setAlignment(Qt.AlignCenter)
+        grid_frames.addWidget(self.datamatrix_num_frame, 2, 1)
 
-        self.datamatrix_frame = QLabel("Codigo DataMatrix")
-        self.datamatrix_frame.setMaximumSize(250, 150)
-        # self.datamatrix_frame.setStyleSheet("border: 2px solid gray;")
-        self.datamatrix_frame.setStyleSheet("border: 2px solid #7f8c8d; background-color: #2c3e50; color: white; font-weight: bold;")
-        self.datamatrix_frame.setAlignment(Qt.AlignCenter)
-        grid.addWidget(self.datamatrix_frame, 3, 1)
+        self.pkn_largo_frame = QLabel("Codigo pkn largo")
+        self.pkn_largo_frame.setMaximumSize(250, 150)
+        # self.pkn_largo_frame.setStyleSheet("border: 2px solid gray;")
+        self.pkn_largo_frame.setStyleSheet("border: 2px solid #7f8c8d; background-color: #2c3e50; color: white; font-weight: bold;")
+        self.pkn_largo_frame.setAlignment(Qt.AlignCenter)
+        grid_frames.addWidget(self.pkn_largo_frame, 0, 2)
 
-        layout.addLayout(grid)
+        self.cve_com_frame = QLabel("Codigo cve com")
+        self.cve_com_frame.setMaximumSize(250, 150)
+        # self.cve_com_frame.setStyleSheet("border: 2px solid gray;")
+        self.cve_com_frame.setStyleSheet("border: 2px solid #7f8c8d; background-color: #2c3e50; color: white; font-weight: bold;")
+        self.cve_com_frame.setAlignment(Qt.AlignCenter)
+        grid_frames.addWidget(self.cve_com_frame, 1, 2)
+
+        self.vin_barra_frame = QLabel("Codigo vin barra")
+        self.vin_barra_frame.setMaximumSize(250, 150)
+        # self.vin_barra_frame.setStyleSheet("border: 2px solid gray;")
+        self.vin_barra_frame.setStyleSheet("border: 2px solid #7f8c8d; background-color: #2c3e50; color: white; font-weight: bold;")
+        self.vin_barra_frame.setAlignment(Qt.AlignCenter)
+        grid_frames.addWidget(self.vin_barra_frame, 2, 2)
+
+        layout.addLayout(grid_frames)
+
+
+        grid_data = QGridLayout()
+
+        self.vin_ult_title = QLabel("Data vin: ")
+        self.vin_ult_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #2c3e50;")
+        grid_data.addWidget(self.vin_ult_title, 0, 0)
+        
+        self.vin_ult_label = QLabel("Esperando transferencia de datos...")
+        self.vin_ult_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #27ae60;")
+        grid_data.addWidget(self.vin_ult_label, 1, 0)
+
+        self.datamatrix_link_title = QLabel("Data datamatrix link: ")
+        self.datamatrix_link_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #2c3e50;")
+        grid_data.addWidget(self.datamatrix_link_title, 2, 0)
+        
+        self.datamatrix_link_label = QLabel("Esperando transferencia de datos...")
+        self.datamatrix_link_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #27ae60;")
+        grid_data.addWidget(self.datamatrix_link_label, 3, 0)
+
+        self.datamatrix_num_title = QLabel("Data datamatrix num: ")
+        self.datamatrix_num_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #2c3e50;")
+        grid_data.addWidget(self.datamatrix_num_title, 4, 0)
+        
+        self.datamatrix_num_label = QLabel("Esperando transferencia de datos...")
+        self.datamatrix_num_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #27ae60;")
+        grid_data.addWidget(self.datamatrix_num_label, 5, 0)
+
+        self.pkn_largo_title = QLabel("Data pkn_largo: ")
+        self.pkn_largo_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #2c3e50;")
+        grid_data.addWidget(self.pkn_largo_title, 0, 1)
+        
+        self.pkn_largo_label = QLabel("Esperando transferencia de datos...")
+        self.pkn_largo_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #27ae60;")
+        grid_data.addWidget(self.pkn_largo_label, 1, 1)
+
+        self.cve_com_title = QLabel("Data cve com: ")
+        self.cve_com_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #2c3e50;")
+        grid_data.addWidget(self.cve_com_title, 2, 1)
+        
+        self.cve_com_label = QLabel("Esperando transferencia de datos...")
+        self.cve_com_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #27ae60;")
+        grid_data.addWidget(self.cve_com_label, 3, 1)
+
+        self.vin_barra_title = QLabel("Data vin barra: ")
+        self.vin_barra_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #2c3e50;")
+        grid_data.addWidget(self.vin_barra_title, 4, 1)
+        
+        self.vin_barra_label = QLabel("Esperando transferencia de datos...")
+        self.vin_barra_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #27ae60;")
+        grid_data.addWidget(self.vin_barra_label, 5, 1)
+
+        layout.addLayout(grid_data)
 
         layout_info = QVBoxLayout()
-        self.barcode_title = QLabel("Codigo de barras: ")
-        self.barcode_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #2c3e50;")
-
-        self.barcode_label = QLabel("Esperando transferencia de datos...")
-        self.barcode_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #27ae60;")
-
-        self.qrcode_title = QLabel("Codigo QR: ")
-        self.qrcode_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #2c3e50;")
-
-        self.qrcode_label = QLabel("Esperando transferencia de datos...")
-        self.qrcode_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #27ae60;")
-
-        self.vin_title = QLabel("Codigo VIN: ")
-        self.vin_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #2c3e50;")
-
-        self.vin_label = QLabel("Esperando transferencia de datos...")
-        self.vin_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #27ae60;")
-
-        self.datamatrix_title = QLabel("Codigo DataMatrix: ")
-        self.datamatrix_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #2c3e50;")
-
-        self.datamatrix_label = QLabel("Esperando transferencia de datos...")
-        self.datamatrix_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #27ae60;")
-
 
         self.tiempo_procesamiento_title = QLabel("Tiempo de procesamiento: ")
         self.tiempo_procesamiento_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #2c3e50;")
@@ -278,15 +419,6 @@ class DroneDashboard(QMainWindow):
         self.num_frame_label = QLabel("Esperando transferencia de datos...")
         self.num_frame_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #27ae60;")
 
-
-        layout_info.addWidget(self.barcode_title)
-        layout_info.addWidget(self.barcode_label)
-        layout_info.addWidget(self.qrcode_title)
-        layout_info.addWidget(self.qrcode_label)
-        layout_info.addWidget(self.vin_title)
-        layout_info.addWidget(self.vin_label)
-        layout_info.addWidget(self.datamatrix_title)
-        layout_info.addWidget(self.datamatrix_label)
 
         layout_info.addWidget(self.tiempo_procesamiento_title)
         layout_info.addWidget(self.tiempo_procesamiento_label)
@@ -309,9 +441,29 @@ class DroneDashboard(QMainWindow):
 
 
         # Pagina 3 (Resultados)=========================================
-        self.page_config = QWidget()
+        self.pagina_resultados = QWidget()
         layout = QVBoxLayout()
         layout.addWidget(QLabel("<h2>Resultados</h2>"))
+
+        self.mapa_widget = MapaDashboard()
+        layout.addWidget(self.mapa_widget)
+
+        grid_btn = QGridLayout()
+
+        self.btn_iniciar_procesamiento = QPushButton("Iniciar procesamiento")
+        self.btn_iniciar_procesamiento.setStyleSheet("background-color: #2ecc71; font-weight: bold; font-size: 14px; height: 45px; color: white;")
+        self.btn_iniciar_procesamiento.clicked.connect(self.iniciar_procesamiento_datos)
+        grid_btn.addWidget(self.btn_iniciar_procesamiento, 0, 0)
+
+        self.btn_actualizar_datos = QPushButton("Actualizar datos")
+        self.btn_actualizar_datos.setStyleSheet("background-color: #2ecc71; font-weight: bold; font-size: 14px; height: 45px; color: white;")
+        self.btn_actualizar_datos.clicked.connect(self.actualizar_datos)
+        grid_btn.addWidget(self.btn_actualizar_datos, 0, 1)
+
+        layout.addLayout(grid_btn)
+
+        self.pagina_resultados.setLayout(layout)
+        self.pages.addWidget(self.pagina_resultados)
 
         # ===============================================================
 
@@ -369,16 +521,17 @@ class DroneDashboard(QMainWindow):
             res = requests.get(f"{self.api_url_analizador}/estado").json()
             
             # 1. Pintar textos detectados
-            self.barcode_label.setText(res["data_barcode"])
-            self.qrcode_label.setText(res["data_qr"])
-            self.vin_label.setText(res["data_vin"])
-            self.datamatrix_label.setText(res["data_datamax"])
+            self.vin_ult_label.setText(res["vin_ult_data"])
+            self.datamatrix_link_label.setText(res["datamatrix_link_data"])
+            self.datamatrix_num_label.setText(res["datamatrix_num_data"])
+            self.pkn_largo_label.setText(res["pkn_largo_data"])
+            self.cve_com_label.setText(res["cve_com_data"])
+            self.vin_barra_label.setText(res["vin_barra_data"])
 
             self.tiempo_procesamiento_label.setText(res["data_tiempo_procesamiento"])
             num_frame = res["data_num_frame"]
             num_frame_max = res["data_num_frame_max"]
             progreso = str(f"{num_frame}/{num_frame_max}")
-            self.datamatrix_label.setText(res["data_datamax"])
             self.num_frame_label.setText(progreso)
 
             # 2. Reconvertir e inyectar el video principal (Base64 -> QPixmap)
@@ -386,14 +539,18 @@ class DroneDashboard(QMainWindow):
                 self.convertir_b64_a_label(res["frame"], self.main_frame)
             # if res["recorte_etiqueta"]:
             #     self.convertir_b64_a_label(res["recorte_etiqueta"], self.label_frame)
-            if res["recorte_barcode"]:
-                self.convertir_b64_a_label(res["recorte_barcode"], self.barcode_frame)
-            if res["recorte_qr"]:
-                self.convertir_b64_a_label(res["recorte_qr"], self.qrcode_frame)
-            if res["recorte_vin"]:
-                self.convertir_b64_a_label(res["recorte_vin"], self.vin_frame)
-            if res["recorte_datamax"]:
-                self.convertir_b64_a_label(res["recorte_datamax"], self.datamatrix_frame)
+            if res["recorte_vin_ult"]:
+                self.convertir_b64_a_label(res["recorte_vin_ult"], self.vin_ult_frame)
+            if res["recorte_datamatrix_link"]:
+                self.convertir_b64_a_label(res["recorte_datamatrix_link"], self.datamatrix_link_frame)
+            if res["recorte_datamatrix_num"]:
+                self.convertir_b64_a_label(res["recorte_datamatrix_num"], self.datamatrix_num_frame)
+            if res["recorte_pkn_largo"]:
+                self.convertir_b64_a_label(res["recorte_pkn_largo"], self.pkn_largo_frame)
+            if res["recorte_cve_com"]:
+                self.convertir_b64_a_label(res["recorte_cve_com"], self.cve_com_frame)
+            if res["recorte_vin_barra"]:
+                self.convertir_b64_a_label(res["recorte_vin_barra"], self.vin_barra_frame)
 
             # Si el backend avisa que ya acabó, paramos el timer de peticiones
             if not res["corriendo"] and res["frame_actual_base64"] is not None:
@@ -426,7 +583,15 @@ class DroneDashboard(QMainWindow):
         pixmap = QPixmap.fromImage(qimage)
         label_target.setPixmap(pixmap.scaled(label_target.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
+    def cambiar_a_pagina_resultados(self):
+        self.mapa_widget.cargar_mapa()
+        self.pages.setCurrentIndex(2)
 
+    def iniciar_procesamiento_datos(self):
+        res_procesamiento = requests.post(f"{self.api_url_procesador}/iniciar", json={"iniciar": int(1)})
+
+    def actualizar_datos(self):
+        self.mapa_widget.cargar_mapa()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

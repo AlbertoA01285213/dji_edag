@@ -168,25 +168,6 @@ def bucle_waypoint(waypoint_path):
     ESTADO_PROCESO["corriendo"] = False
     # Dejamos un valor no nulo al terminar para que se active tu QMessageBox en el frontend
     ESTADO_PROCESO["frame_actual_base64"] = "finalizado"
-
-
-# from fastapi import Response
-
-# @app.get("/grafica_en_vivo")
-# def ver_grafica_en_navegador():
-#     """Endpoint de diagnóstico para ver la imagen real desde cualquier navegador"""
-#     # Si no hay gráfica aún o el proceso no ha iniciado
-#     if not ESTADO_PROCESO["grafica"]:
-#         return {"status": "esperando", "message": "Inicia el análisis en el dashboard primero para generar la imagen."}
-    
-#     try:
-#         # Decodificamos el string Base64 actual a bytes puros de una imagen PNG
-#         imagen_bytes = base64.b64decode(ESTADO_PROCESO["grafica"])
-        
-#         # Le respondemos al navegador con los bytes crudos de la imagen y el formato correcto
-#         return Response(content=imagen_bytes, media_type="image/png")
-#     except Exception as e:
-#         return {"status": "error", "message": f"No se pudo decodificar la imagen: {e}"}
     
 
 @app.post("/iniciar")
