@@ -76,6 +76,7 @@ conn.commit()
 conn.close()
 
 DEBE_PARAR = False
+ESTA_PAUSADO = False
 CONFIDENCE_THRESHOLD = 0.8
 
 # Configuraciones de rutas fijas de tu proyecto
@@ -92,6 +93,9 @@ modelo_codigos = YOLO(PATH_MODELO_CODIGOS)
 
 class VideoPayload(BaseModel):
     ruta_video: str
+
+class VideoPause(BaseModel):
+    pausa_video: int
 
 
 def optimizar_y_convertir_base64(img, max_width=640):
@@ -257,13 +261,11 @@ def ordenar_puntos(pts):
     """Ordena 4 puntos en orden estricto: [Top-Left, Top-Right, Bottom-Right, Bottom-Left]"""
     pts = pts.reshape(4, 2)
     nuevo_orden = np.zeros((4, 2), dtype=np.float32)
-    
-    # Top-Left tiene la suma mínima, Bottom-Right la suma máxima
+
     suma = pts.sum(axis=1)
     nuevo_orden[0] = pts[np.argmin(suma)]
     nuevo_orden[2] = pts[np.argmax(suma)]
     
-    # Top-Right tiene la diferencia (y - x) mínima, Bottom-Left la máxima
     dif = np.diff(pts, axis=1).flatten()
     nuevo_orden[1] = pts[np.argmin(dif)]
     nuevo_orden[3] = pts[np.argmax(dif)]
@@ -306,45 +308,26 @@ def rectificar(img):
         box = cv2.boxPoints(rect)
         pts = ordenar_puntos(box)
 
-    # Extraemos los puntos superiores para calcular la pendiente de la línea
     tl, tr, br, bl = pts
 
-    # Calcular el ángulo exacto en grados usando arcotangente (delta_y / delta_x)
     angle = np.degrees(np.arctan2(tr[1] - tl[1], tr[0] - tl[0]))
 
-    # Si la imagen ya está prácticamente derecha (menos de 0.5 grados), no gastamos CPU
     if abs(angle) < 0.5:
         return img, True, pts.astype(int)
 
-    # --- NUEVA ESTRATEGIA: ROTACIÓN SIN PÉRDIDA ---
-    # 1. Obtener el centro original del recorte de YOLO
     cX, cY = w // 2, h // 2
-    
-    # 2. Generar la matriz de rotación en 2D basada en el ángulo detectado
+
     M = cv2.getRotationMatrix2D((cX, cY), angle, 1.0)
     
-    # 3. Calcular el valor absoluto de los senos y cosenos para redimensionar el lienzo
     cos = np.abs(M[0, 0])
     sin = np.abs(M[0, 1])
-    
-    # Nueva anchura y altura matemática para que quepa la imagen rotada completa sin cortes
     nW = int((h * sin) + (w * cos))
     nH = int((h * cos) + (w * sin))
     
-    # 4. Modificar la matriz de traslación para mover el nuevo centro al lienzo expandido
     M[0, 2] += (nW / 2) - cX
     M[1, 2] += (nH / 2) - cY
     
-    # 5. Ejecutar el giro usando interpolación cúbica (conserva mejor la definición de las barras)
-    # IMPORTANTE: borderValue=(255, 255, 255) genera márgenes blancos en lugar de negros
-    warped = cv2.warpAffine(
-        img, 
-        M, 
-        (nW, nH), 
-        flags=cv2.INTER_CUBIC, 
-        borderMode=cv2.BORDER_CONSTANT, 
-        borderValue=(255, 255, 255)
-    )
+    warped = cv2.warpAffine(img, M, (nW, nH), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
 
     return warped, True, pts.astype(int)
 
@@ -377,6 +360,10 @@ def bucle_vision_artificial(video_path):
 
 
     while cap.isOpened() and not DEBE_PARAR:
+        if ESTA_PAUSADO:
+            time.sleep(0.1)
+            continue
+
         ret, frame = cap.read()
         if not ret:
             break
@@ -555,12 +542,17 @@ def iniciar_analisis(payload: VideoPayload, background_tasks: BackgroundTasks):
     return {"status": "success", "message": "Análisis iniciado correctamente."}
 
 @app.post("/parar")
-def parar_analisis():
+def parar_analisis(payload: VideoPause):
     global DEBE_PARAR
+    global ESTA_PAUSADO
     if not ESTADO_PROCESO["corriendo"]:
         return {"status": "error", "message": "No hay ningún análisis activo que detener."}
     
-    DEBE_PARAR = True
+    if payload.pausa_video == 0:
+        ESTA_PAUSADO = True
+
+    if payload.pausa_video == 1:
+        ESTA_PAUSADO = False
     return {"status": "success", "message": "Se ha enviado la señal de parada al analizador."}
 
 @app.get("/estado")

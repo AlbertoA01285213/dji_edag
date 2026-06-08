@@ -1,0 +1,882 @@
+#!/usr/bin/env python3
+import os
+import sys
+import cv2
+import json
+import base64
+import sqlite3
+import requests
+import folium
+import numpy as np
+from cv_bridge import CvBridge
+from sensor_msgs.msg import Image, NavSatFix  # o el tipo que uses para odometría
+from PySide6.QtGui import QPixmap, QImage, QPainter, QColor, QPen, QCursor
+from PySide6.QtCore import Signal, QThread, Qt, Slot, QPoint, QObject, QTimer, QSize
+from PySide6.QtWidgets import (QApplication, QMainWindow, QPushButton, QToolTip, QComboBox, 
+                             QVBoxLayout, QHBoxLayout, QWidget, QStackedWidget, QMessageBox,
+                             QLabel, QFrame, QGridLayout, QSpinBox, QDoubleSpinBox, QWidget)
+from PySide6.QtWebEngineWidgets import QWebEngineView
+
+class AnalisisSignals(QObject):
+    """Clase puente para emitir datos desde el hilo de YOLO hacia la GUI"""
+    nuevo_frame_principal = Signal(QImage)
+    nuevo_codigo_detectado = Signal(str, str, QImage)
+
+class ZonaArrastrarArchivo(QFrame):
+    def __init__(self, al_seleccionar_archivo_callback, tipo_archivo=None):
+        super().__init__()
+        self.callback_archivo = al_seleccionar_archivo_callback
+        # Guardamos si es "video" o "subtitulos" para validar en el drop
+        self.tipo_archivo = tipo_archivo 
+        
+        self.setFrameShape(QFrame.StyledPanel)
+        self.setFrameShadow(QFrame.Sunken)
+        self.setStyleSheet("""
+            QFrame { border: 2px dashed #e67e22; border-radius: 8px; background-color: #ecf0f1; }
+            QFrame:hover { background-color: #fdf2e9; border: 2px dashed #d35400; }
+        """)
+        self.setMinimumHeight(120)
+        self.setAcceptDrops(True)
+
+        layout = QVBoxLayout()
+        # Ajustamos el texto inicial según el tipo de archivo asignado
+        texto_inicial = "Arrastra tu archivo aquí"
+        if self.tipo_archivo == "video":
+            texto_inicial = "Arrastra tu archivo de Video (.mp4, .avi, .mkv)"
+        elif self.tipo_archivo == "subtitulos":
+            texto_inicial = "Arrastra tus Subtítulos (.srt)"
+            
+        self.label_info = QLabel(texto_inicial)
+        self.label_info.setAlignment(Qt.AlignCenter)
+        self.label_info.setStyleSheet("color: #7f8c8d; font-size: 13px; font-weight: bold; border: none; background: transparent;")
+        layout.addWidget(self.label_info)
+        self.setLayout(layout)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            urls = event.mimeData().urls()
+            if urls and urls[0].toLocalFile():
+                event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        for url in event.mimeData().urls():
+            ruta_archivo = url.toLocalFile()
+            ruta_minusculas = ruta_archivo.lower()
+            
+            # CORRECCIÓN EXPLICITA: Se agrupan las extensiones en una tupla ( )
+            extensiones_video = ('.mp4', '.avi', '.mkv', '.mov')
+            extensiones_subtitulos = ('.srt',) # Una tupla de un elemento lleva coma al final
+
+            es_valido = False
+            mensaje_error = "Archivo no soportado."
+
+            # Validación inteligente según el propósito de la zona de arrastre
+            if self.tipo_archivo == "video":
+                if ruta_minusculas.endswith(extensiones_video):
+                    es_valido = True
+                else:
+                    mensaje_error = "Por favor, arrastra un formato de video válido (.mp4, .avi, .mkv, .mov)"
+            elif self.tipo_archivo == "subtitulos":
+                if ruta_minusculas.endswith(extensiones_subtitulos):
+                    es_valido = True
+                else:
+                    mensaje_error = "Por favor, arrastra un archivo de telemetría o subtítulos válido (.srt)"
+            else:
+                # Si no se especificó tipo, acepta cualquiera usando la tupla corregida
+                if ruta_minusculas.endswith(extensiones_video + extensiones_subtitulos):
+                    es_valido = True
+
+            if es_valido:
+                # Cambiamos el texto del recuadro para darle feedback visual inmediato al usuario
+                nombre_archivo = os.path.basename(ruta_archivo)
+                self.label_info.setText(f"¡Archivo cargado!\n{nombre_archivo}")
+                self.label_info.setStyleSheet("color: #27ae60; font-size: 13px; font-weight: bold; border: none; background: transparent;")
+                
+                self.callback_archivo(ruta_archivo)
+                event.acceptProposedAction()
+            else:
+                msg = QMessageBox(QMessageBox.Warning, "Archivo no válido", mensaje_error, parent=self)
+                msg.setStyleSheet("QLabel{ color: #2c3e50; } QPushButton{ background-color: #dcdde1; color: black; }")
+                msg.exec()
+                
+class MapaDashboard(QFrame):
+    def __init__(self):
+        super().__init__()
+        self.setFrameShape(QFrame.StyledPanel)
+        self.setFrameShadow(QFrame.Sunken)
+        self.setMinimumHeight(500)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self.vista_web = QWebEngineView()
+        layout.addWidget(self.vista_web)
+
+        self.cargar_mapa()
+
+    def cargar_mapa(self):
+        data = self.obtener_data_db()
+
+        if not data:
+            lat_inicial, lon_inicial, = 25.584, -100.266
+        else:
+            lat_inicial = data[0]['lat']
+            lon_inicial = data[0]['lon']
+
+        mapa = folium.Map(location=[lat_inicial, lon_inicial], zoom_start=17, tiles="CartoDB dark_matter")
+
+        
+        for et in data:
+            # html_info = f"""
+            # <div style="font-family: Arial; color: #white; background-color: #2c3e50; padding: 10px; border-radius: 5px;">
+            #     <b>VIN_ULT:</b> {et['vin_ult']}<br>
+            #     <b>DM_LINK:</b> {et['datamatrix_link']}<br>
+            #     <b>DM_NUM:</b> {et['datamatrix_num']}<br>
+            #     <b>PKN_LA:</b> {et['pkn_largo']}<br>
+            #     <b>CVE_COM:</b> {et['cve_com']}<br>
+            # </div>
+            # """
+
+            html_info = f"""
+            <div style="font-family: 'Segoe UI', Arial; color: white; background-color: #2c3e50; padding: 12px; border-radius: 6px; min-width: 200px; box-shadow: 2px 2px 10px rgba(0,0,0,0.5);">
+                <span style="color: #1abc9c; font-weight: bold; font-size: 14px;">Etiqueta Detectada</span><hr style="border: 0; border-top: 1px solid #7f8c8d; margin: 6px 0;">
+                <b>VIN (Últ):</b> {et['vin_ult']}<br>
+                <b>DM Link:</b> <span style="font-size: 11px; color: #3498db;">{et['datamatrix_link']}</span><br>
+                <b>DM Núm:</b> {et['datamatrix_num']}<br>
+                <b>PKN Largo:</b> {et['pkn_largo']}<br>
+                <b>CVE COM:</b> <span style="background-color: #e67e22; padding: 2px 5px; border-radius: 3px; font-size: 11px;">{et['cve_com']}</span>
+            </div>
+            """
+
+            folium.CircleMarker(
+                location=[et["lat"], et["lon"]],
+                radius=8,
+                color="#1abc9c",
+                fill=True,
+                fill_color="#1abc9c",
+                tooltip=folium.Tooltip(html_info, sticky=True)
+            ).add_to(mapa)
+
+        html_puro = mapa._repr_html_()
+        self.vista_web.setHtml(html_puro)
+
+
+    def obtener_data_db(self):
+        detecciones = []
+        if not os.path.exists("datos.db"):
+            return detecciones
+
+        try:
+            conn = sqlite3.connect("datos.db")
+            cursor = conn.cursor()
+            # Validamos que la tabla exista antes de intentar consultar para prevenir fallos en la UI
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='etiquetas_procesadas'")
+            if not cursor.fetchone():
+                conn.close()
+                return detecciones
+
+            cursor.execute("SELECT id, vin_ult, datamatrix_link, datamatrix_num, pkn_largo, cve_com, latitud, longitud FROM etiquetas_procesadas")
+            rows = cursor.fetchall()
+            for r in rows:
+                detecciones.append({
+                    "id": r[0],
+                    "vin_ult": r[1],
+                    "datamatrix_link": r[2], # Corregido: Se añade la 'r' faltante
+                    "datamatrix_num": r[3],
+                    "pkn_largo": r[4],
+                    "cve_com": r[5],
+                    "lat": float(r[6]) if r[6] else 0.0,
+                    "lon": float(r[7]) if r[7] else 0.0
+                })
+            conn.close()
+        except Exception as e:
+            print(f"Error crítico leyendo DB desde el Dashboard: {e}")
+        return detecciones
+
+
+class DroneDashboard(QMainWindow):
+    def __init__(self):
+        super().__init__()
+
+        self.setWindowTitle("Drone Mission Control v2.0")
+        self.resize(1000, 650)
+
+        self.video_seleccionado = None
+        self.srt_seleccionado = None
+
+        self.api_url_analizador = "http://127.0.0.1:8000"
+        self.api_url_graficador = "http://127.0.0.2:8001"
+        self.api_url_procesador = "http://127.0.0.3:8002"
+
+        self.timer_actualizador = QTimer()
+        self.timer_actualizador.setInterval(60) # Actualiza a ~16 FPS la GUI
+        self.timer_actualizador.timeout.connect(self.solicitar_actualizacion_servidor_analisis) 
+        self.timer_actualizador.timeout.connect(self.solicitar_actualizacion_servidor_grafica)       
+
+
+        self.main_layout = QVBoxLayout()
+        self.central_widget = QWidget()
+        self.setCentralWidget(self.central_widget)
+        self.central_widget.setLayout(self.main_layout)
+
+        self.topbar_widget = QWidget()
+        self.topbar_widget.setObjectName("TopBar")
+        self.topbar_widget.setStyleSheet("""
+
+            QPushButton {
+                background-color: transparent;
+                border: none;
+                color: #5a6c7d;
+                font-family: 'Segoe UI', Arial, sans-serif;
+                font-size: 14px;
+                font-weight: 600;
+                padding: 10px 20px;
+                margin: 5px 8px;
+                border-radius: 6px;
+            }
+            QPushButton:hover {
+                background-color: #f4f6f7;
+                color: #2c3e50;
+            }
+            QPushButton:pressed {
+                background-color: #eaecee;
+            }
+        """)
+
+        self.topbar = QHBoxLayout(self.topbar_widget)
+        self.topbar.setContentsMargins(20, 5, 20, 5)
+
+        self.btn_configuracion = QPushButton("Configuración")
+        self.btn_video = QPushButton("Analisis")
+        self.btn_resultados = QPushButton("Resultados")
+
+        self.topbar.addStretch()
+
+        self.topbar.addWidget(self.btn_configuracion)
+        self.topbar.addWidget(self.btn_video)
+        self.topbar.addWidget(self.btn_resultados)
+
+        self.topbar.addStretch()
+
+        self.main_layout.addWidget(self.topbar_widget)
+
+        self.pages = QStackedWidget()
+        self.main_layout.addWidget(self.pages)
+
+        self.btn_configuracion.clicked.connect(lambda: self.pages.setCurrentIndex(1))
+        self.btn_video.clicked.connect(lambda: self.pages.setCurrentIndex(2))
+        self.btn_resultados.clicked.connect(lambda: self.pages.setCurrentIndex(4))
+
+        self.init_pages()
+
+    def init_pages(self):
+        # =========================================================================
+        # PAGINA 1: Intro
+        # =========================================================================
+        self.pagina_intro = QWidget()
+        layout = QVBoxLayout()
+        layout.setContentsMargins(40, 50, 40, 50)
+
+        grid_main = QGridLayout()
+        grid_main.setSpacing(20)
+
+        self.logo_tec = QLabel()
+        logo_tec_img = QPixmap("imagenes/logo_tec.png")
+        self.logo_tec.setPixmap(logo_tec_img)
+        self.logo_tec.setScaledContents(True)
+        self.logo_tec.setFixedSize(120, 120)
+        self.logo_tec.setAlignment(Qt.AlignmentFlag.AlignCenter) # Centers the image
+
+        grid_main.addWidget(self.logo_tec, 0, 0)
+        
+        layout_central = QVBoxLayout()
+        layout_central.setSpacing(10)
+
+        titulo_label = QLabel("Analizador de videos DJI")
+        titulo_label.setStyleSheet("""
+            font-family: 'Segoe UI', Arial, sans-serif;
+            font-size: 28px;
+            font-weight: 800;
+            color: #2c3e50;
+        """)
+        titulo_label.setAlignment(Qt.AlignmentFlag.AlignCenter) # <--- Aquí se centra el texto
+
+        # Subtítulo / Etiqueta de Equipo
+        subtitulo_label = QLabel("PROYECTO DE DESARROLLO / INTEGRADOR")
+        subtitulo_label.setStyleSheet("""
+            font-family: 'Segoe UI', Arial, sans-serif;
+            font-size: 11px;
+            font-weight: bold;
+            color: #7f8c8d;
+            letter-spacing: 2px;
+        """)
+        subtitulo_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        # Separador visual sutil entre el título y los autores
+        linea_separadora = QFrame()
+        linea_separadora.setFrameShape(QFrame.Shape.HLine)
+        linea_separadora.setFrameShadow(QFrame.Shadow.Sunken)
+        linea_separadora.setStyleSheet("color: #bdc3c7; background-color: #bdc3c7; max-height: 1px;")
+
+        # Lista de Autores / Integrantes
+        autores_label = QLabel("Alberto  •  Angela  •  Jorge  •  Takeshi")
+        autores_label.setStyleSheet("""
+            font-family: 'Segoe UI', Arial, sans-serif;
+            font-size: 14px;
+            font-weight: 500;
+            color: #34495e;
+        """)
+        autores_label.setAlignment(Qt.AlignmentFlag.AlignCenter) # <--- Aquí se centran los nombres
+
+        # Construimos el orden del bloque central
+        layout_central.addWidget(subtitulo_label)
+        layout_central.addWidget(titulo_label)
+        layout_central.addSpacing(5)
+        layout_central.addWidget(linea_separadora)
+        layout_central.addSpacing(5)
+        layout_central.addWidget(autores_label)
+
+        # Agregamos el contenedor central al Grid
+        grid_main.addLayout(layout_central, 0, 1)
+
+        self.logo_edag = QLabel()
+        logo_edag_img = QPixmap("imagenes/logo_edag.jpeg")
+        self.logo_edag.setPixmap(logo_edag_img)
+        self.logo_edag.setScaledContents(True)
+        self.logo_edag.setFixedSize(120, 120)
+        self.logo_edag.setAlignment(Qt.AlignmentFlag.AlignCenter) # Centers the image
+
+        grid_main.addWidget(self.logo_edag, 0, 2)
+
+        layout.addLayout(grid_main)
+
+        layout.addStretch()
+        self.pagina_intro.setLayout(layout)
+        self.pages.addWidget(self.pagina_intro)
+
+        # =========================================================================
+        # PAGINA 1: Configuración de análisis
+        # =========================================================================
+        # Datos para modificar: Frames para bytetrack, confidence, 
+        self.pagina_configuracion = QWidget()
+        layout = QVBoxLayout()
+
+        layout.addSpacing(30)
+        layout.addWidget(QLabel("<h1>Configuracion</h1>"))
+        layout.addSpacing(30)
+
+        grid_config = QGridLayout()
+
+        self.confidence_label = QLabel("Confidence:")
+        self.confidence_config = QSpinBox()
+        self.confidence_config.setRange(0, 100)
+        self.confidence_config.setValue(80)
+        self.confidence_config.setSuffix("%")
+
+        grid_config.addWidget(self.confidence_label, 0, 0)
+        grid_config.addWidget(self.confidence_config, 1, 0)
+
+        self.bytetrack_label = QLabel("Bytetrack frames:")
+        self.bytetrack_config = QSpinBox()
+        self.bytetrack_config.setRange(0, 100)
+        self.bytetrack_config.setValue(1)
+
+        grid_config.addWidget(self.bytetrack_label, 0, 1)
+        grid_config.addWidget(self.bytetrack_config, 1, 1)
+
+        layout.addLayout(grid_config)
+
+
+        layout.addStretch()
+        self.pagina_configuracion.setLayout(layout)
+        self.pages.addWidget(self.pagina_configuracion)
+
+        # =========================================================================
+        # PAGINA 2: Seleccion de videos
+        # =========================================================================
+        self.pagina_seleccion_videos = QWidget()
+        layout = QVBoxLayout()
+        layout.setContentsMargins(40, 30, 40, 30)
+
+        layout.addSpacing(10)
+        titulo_seccion = QLabel("Selección de archivos")
+        titulo_seccion.setStyleSheet("font-family: 'Segoe UI'; font-size: 24px; font-weight: bold; color: #2c3e50;")
+        layout.addWidget(titulo_seccion)
+        layout.addSpacing(20)
+
+        grid_archivos = QGridLayout()
+        grid_archivos.setSpacing(30)
+
+
+        layout_video = QVBoxLayout()
+        lbl_vid_titulo = QLabel("Archivo de Video")
+        lbl_vid_titulo.setStyleSheet("font-family: 'Segoe UI'; font-size: 14px; font-weight: 600; color: #34495e;")
+        layout_video.addWidget(lbl_vid_titulo)
+        layout_video.addSpacing(5)
+
+        self.zona_drag_drop_video = ZonaArrastrarArchivo(self.actualizar_video_seleccionado)
+        self.zona_drag_drop_video.setMinimumHeight(180) 
+        layout_video.addWidget(self.zona_drag_drop_video)
+
+        self.label_video = QLabel("<b>Video seleccionado:</b> Ninguno (Usa el buscador o arrastra un archivo)")
+        self.label_video.setStyleSheet("font-family: 'Segoe UI'; color: #7f8c8d; font-size: 12px;")
+        self.label_video.setWordWrap(True)
+        layout_video.addWidget(self.label_video)
+
+        grid_archivos.addLayout(layout_video, 0, 0)
+
+
+        layout_subtitulos = QVBoxLayout()
+        lbl_sub_titulo = QLabel("Archivo de Subtítulos (.SRT)")
+        lbl_sub_titulo.setStyleSheet("font-family: 'Segoe UI'; font-size: 14px; font-weight: 600; color: #34495e;")
+        layout_subtitulos.addWidget(lbl_sub_titulo)
+        layout_subtitulos.addSpacing(5)
+
+        self.zona_drag_drop_subtitulos = ZonaArrastrarArchivo(self.actualizar_srt_seleccionado)
+        self.zona_drag_drop_subtitulos.setMinimumHeight(180)
+        layout_subtitulos.addWidget(self.zona_drag_drop_subtitulos)
+
+        self.label_subtitulos = QLabel("<b>Subtitulos seleccionado:</b> Ninguno (Usa el buscador o arrastra un archivo)")
+        self.label_subtitulos.setStyleSheet("font-family: 'Segoe UI'; color: #7f8c8d; font-size: 12px;")
+        self.label_subtitulos.setWordWrap(True)
+        layout_subtitulos.addWidget(self.label_subtitulos)
+
+        grid_archivos.addLayout(layout_subtitulos, 0, 1)
+
+        layout.addLayout(grid_archivos)
+        
+        layout.addSpacing(30)
+
+
+        grid_botones = QGridLayout()
+        grid_botones.setSpacing(15)
+
+        self.btn_regresar = QPushButton("Regresar al Inicio")
+        self.btn_regresar.setStyleSheet("""
+            QPushButton {
+                background-color: #7f8c8d; font-weight: bold; font-size: 14px; height: 45px; color: white; border-radius: 6px; border: none;
+            }
+            QPushButton:hover { background-color: #95a5a6; }
+        """)
+
+        self.btn_regresar.clicked.connect(lambda: self.pages.setCurrentIndex(1))
+        grid_botones.addWidget(self.btn_regresar, 0, 0)
+
+        self.btn_iniciar = QPushButton("Siguiente: Analizar Video")
+        self.btn_iniciar.setStyleSheet("""
+            QPushButton {
+                background-color: #2ecc71; font-weight: bold; font-size: 14px; height: 45px; color: white; border-radius: 6px; border: none;
+            }
+            QPushButton:hover { background-color: #27ae60; }
+        """)
+
+        self.btn_iniciar.clicked.connect(self.iniciar_analisis)
+        grid_botones.addWidget(self.btn_iniciar, 0, 1)
+
+
+        layout.addLayout(grid_botones)
+
+
+        layout.addStretch()
+        self.pagina_seleccion_videos.setLayout(layout)
+        self.pages.addWidget(self.pagina_seleccion_videos)
+
+        # =========================================================================
+        # PAGINA 3: Vista de Análisis (La página "secreta" o activa de reproducción)
+        # =========================================================================
+        self.pagina_analisis = QWidget()
+        layout = QVBoxLayout()
+
+        grid_frames = QGridLayout()
+
+        # Columna izquierda
+        self.main_frame = QLabel("Esperando video")
+        self.main_frame.setMinimumSize(419, 229)
+        self.main_frame.setMaximumSize(420, 230) # 640 360
+        # self.main_frame.setStyleSheet("border: 2px solid gray;")
+        self.main_frame.setStyleSheet("border: 2px solid #7f8c8d; background-color: #2c3e50; color: white; font-weight: bold;")
+        self.main_frame.setAlignment(Qt.AlignCenter)
+        grid_frames.addWidget(self.main_frame, 0, 0, 2, 1)
+
+        self.graph_frame = QLabel("Grafica posicion")
+        self.graph_frame.setMinimumSize(419, 229)
+        self.graph_frame.setMaximumSize(420, 230)
+        # self.graph_frame.setStyleSheet("border: 2px solid gray;")
+        self.graph_frame.setStyleSheet("border: 2px solid #7f8c8d; background-color: #2c3e50; color: white; font-weight: bold;")
+        self.graph_frame.setAlignment(Qt.AlignCenter)
+        grid_frames.addWidget(self.graph_frame, 2, 0, 2, 1)
+
+        # Columna derecha
+        self.vin_ult_frame = QLabel("Codigo de vin_ult")
+        self.vin_ult_frame.setMinimumSize(249, 149)
+        self.vin_ult_frame.setMaximumSize(250, 150)
+        # self.vin_ult_frame.setStyleSheet("border: 2px solid gray;")
+        self.vin_ult_frame.setStyleSheet("border: 2px solid #7f8c8d; background-color: #2c3e50; color: white; font-weight: bold;")
+        self.vin_ult_frame.setAlignment(Qt.AlignCenter)
+        grid_frames.addWidget(self.vin_ult_frame, 0, 1)
+
+        self.datamatrix_link_frame = QLabel("Codigo datamatrix link")
+        self.datamatrix_link_frame.setMinimumSize(249, 149)
+        self.datamatrix_link_frame.setMaximumSize(250, 150)
+        # self.datamatrix_link_frame.setStyleSheet("border: 2px solid gray;")
+        self.datamatrix_link_frame.setStyleSheet("border: 2px solid #7f8c8d; background-color: #2c3e50; color: white; font-weight: bold;")
+        self.datamatrix_link_frame.setAlignment(Qt.AlignCenter)
+        grid_frames.addWidget(self.datamatrix_link_frame, 1, 1)
+
+        self.datamatrix_num_frame = QLabel("Codigo datamatrix num")
+        self.datamatrix_num_frame.setMinimumSize(249, 149)
+        self.datamatrix_num_frame.setMaximumSize(250, 150)
+        # self.datamatrix_num_frame.setStyleSheet("border: 2px solid gray;")
+        self.datamatrix_num_frame.setStyleSheet("border: 2px solid #7f8c8d; background-color: #2c3e50; color: white; font-weight: bold;")
+        self.datamatrix_num_frame.setAlignment(Qt.AlignCenter)
+        grid_frames.addWidget(self.datamatrix_num_frame, 2, 1)
+
+        self.pkn_largo_frame = QLabel("Codigo pkn largo")
+        self.pkn_largo_frame.setMinimumSize(249, 149)
+        self.pkn_largo_frame.setMaximumSize(250, 150)
+        # self.pkn_largo_frame.setStyleSheet("border: 2px solid gray;")
+        self.pkn_largo_frame.setStyleSheet("border: 2px solid #7f8c8d; background-color: #2c3e50; color: white; font-weight: bold;")
+        self.pkn_largo_frame.setAlignment(Qt.AlignCenter)
+        grid_frames.addWidget(self.pkn_largo_frame, 0, 2)
+
+        self.cve_com_frame = QLabel("Codigo cve com")
+        self.cve_com_frame.setMinimumSize(249, 149)
+        self.cve_com_frame.setMaximumSize(250, 150)
+        # self.cve_com_frame.setStyleSheet("border: 2px solid gray;")
+        self.cve_com_frame.setStyleSheet("border: 2px solid #7f8c8d; background-color: #2c3e50; color: white; font-weight: bold;")
+        self.cve_com_frame.setAlignment(Qt.AlignCenter)
+        grid_frames.addWidget(self.cve_com_frame, 1, 2)
+
+        self.vin_barra_frame = QLabel("Codigo vin barra")
+        self.vin_barra_frame.setMinimumSize(249, 149)
+        self.vin_barra_frame.setMaximumSize(250, 150)
+        # self.vin_barra_frame.setStyleSheet("border: 2px solid gray;")
+        self.vin_barra_frame.setStyleSheet("border: 2px solid #7f8c8d; background-color: #2c3e50; color: white; font-weight: bold;")
+        self.vin_barra_frame.setAlignment(Qt.AlignCenter)
+        grid_frames.addWidget(self.vin_barra_frame, 2, 2)
+
+        layout.addLayout(grid_frames)
+
+
+        grid_data = QGridLayout()
+
+        self.vin_ult_title = QLabel("Data vin: ")
+        self.vin_ult_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #2c3e50;")
+        grid_data.addWidget(self.vin_ult_title, 0, 0)
+        
+        self.vin_ult_label = QLabel("Esperando transferencia de datos...")
+        self.vin_ult_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #27ae60;")
+        grid_data.addWidget(self.vin_ult_label, 1, 0)
+
+        self.datamatrix_link_title = QLabel("Data datamatrix link: ")
+        self.datamatrix_link_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #2c3e50;")
+        grid_data.addWidget(self.datamatrix_link_title, 2, 0)
+        
+        self.datamatrix_link_label = QLabel("Esperando transferencia de datos...")
+        self.datamatrix_link_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #27ae60;")
+        grid_data.addWidget(self.datamatrix_link_label, 3, 0)
+
+        self.datamatrix_num_title = QLabel("Data datamatrix num: ")
+        self.datamatrix_num_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #2c3e50;")
+        grid_data.addWidget(self.datamatrix_num_title, 4, 0)
+        
+        self.datamatrix_num_label = QLabel("Esperando transferencia de datos...")
+        self.datamatrix_num_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #27ae60;")
+        grid_data.addWidget(self.datamatrix_num_label, 5, 0)
+
+        self.pkn_largo_title = QLabel("Data pkn_largo: ")
+        self.pkn_largo_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #2c3e50;")
+        grid_data.addWidget(self.pkn_largo_title, 0, 1)
+        
+        self.pkn_largo_label = QLabel("Esperando transferencia de datos...")
+        self.pkn_largo_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #27ae60;")
+        grid_data.addWidget(self.pkn_largo_label, 1, 1)
+
+        self.cve_com_title = QLabel("Data cve com: ")
+        self.cve_com_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #2c3e50;")
+        grid_data.addWidget(self.cve_com_title, 2, 1)
+        
+        self.cve_com_label = QLabel("Esperando transferencia de datos...")
+        self.cve_com_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #27ae60;")
+        grid_data.addWidget(self.cve_com_label, 3, 1)
+
+        self.vin_barra_title = QLabel("Data vin barra: ")
+        self.vin_barra_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #2c3e50;")
+        grid_data.addWidget(self.vin_barra_title, 4, 1)
+        
+        self.vin_barra_label = QLabel("Esperando transferencia de datos...")
+        self.vin_barra_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #27ae60;")
+        grid_data.addWidget(self.vin_barra_label, 5, 1)
+
+        layout.addLayout(grid_data)
+
+        hline = QFrame()
+        hline.setFrameShape(QFrame.Shape.HLine)
+        hline.setFrameShadow(QFrame.Shadow.Sunken)
+        hline.setStyleSheet("background-color: #838485;") 
+        layout.addWidget(hline)
+
+        layout_info = QVBoxLayout()
+
+        self.tiempo_procesamiento_title = QLabel("Tiempo de procesamiento: ")
+        self.tiempo_procesamiento_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #2c3e50;")
+
+        self.tiempo_procesamiento_label = QLabel("Esperando transferencia de datos...")
+        self.tiempo_procesamiento_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #27ae60;")
+
+        self.num_frame_title = QLabel("Numero de frames: ")
+        self.num_frame_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #2c3e50;")
+
+        self.num_frame_label = QLabel("Esperando transferencia de datos...")
+        self.num_frame_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #27ae60;")
+
+
+        layout_info.addWidget(self.tiempo_procesamiento_title)
+        layout_info.addWidget(self.tiempo_procesamiento_label)
+        layout_info.addWidget(self.num_frame_title)
+        layout_info.addWidget(self.num_frame_label)
+
+        layout.addLayout(layout_info)
+
+
+        grid_botones = QGridLayout()
+        grid_botones.setSpacing(15)
+
+        self.btn_pausa = QPushButton("Pausa")
+        self.btn_pausa.setStyleSheet("""
+            QPushButton {
+                background-color: #e3230e; font-weight: bold; font-size: 14px; height: 45px; color: white; border-radius: 6px; border: none;
+            }
+            QPushButton:hover { background-color: #b51e0d; }
+        """)
+
+        self.btn_pausa.clicked.connect(self.pausar_analisis)
+        grid_botones.addWidget(self.btn_pausa, 0, 0)
+
+
+        self.btn_reanudar = QPushButton("Reanudar")
+        self.btn_reanudar.setStyleSheet("""
+            QPushButton {
+                background-color: #5c5c5c; font-weight: bold; font-size: 14px; height: 45px; color: white; border-radius: 6px; border: none;
+            }
+            QPushButton:hover { background-color: #5c5c5c; }
+        """)
+
+        self.btn_reanudar.clicked.connect(self.reanudar_analisis)
+        grid_botones.addWidget(self.btn_reanudar, 0, 1)
+
+
+        layout.addLayout(grid_botones)
+
+
+        layout.addStretch()
+        self.pagina_analisis.setLayout(layout)
+        self.pages.addWidget(self.pagina_analisis)
+
+        # =========================================================================
+        # PAGINA 4: Resultados
+        # =========================================================================
+        self.pagina_resultados = QWidget()
+        layout = QVBoxLayout()
+
+        layout.addWidget(QLabel("<h2>Resultados</h2>"))
+
+        self.mapa_widget = MapaDashboard()
+        layout.addWidget(self.mapa_widget)
+
+        grid_btn = QGridLayout()
+
+        self.btn_iniciar_procesamiento = QPushButton("Iniciar procesamiento")
+        self.btn_iniciar_procesamiento.setStyleSheet("background-color: #2ecc71; font-weight: bold; font-size: 14px; height: 45px; color: white;")
+        self.btn_iniciar_procesamiento.clicked.connect(self.iniciar_procesamiento_datos)
+        grid_btn.addWidget(self.btn_iniciar_procesamiento, 0, 0)
+
+        self.btn_actualizar_datos = QPushButton("Actualizar datos")
+        self.btn_actualizar_datos.setStyleSheet("background-color: #2ecc71; font-weight: bold; font-size: 14px; height: 45px; color: white;")
+        self.btn_actualizar_datos.clicked.connect(self.actualizar_datos)
+        grid_btn.addWidget(self.btn_actualizar_datos, 0, 1)
+
+        layout.addLayout(grid_btn)
+
+        layout.addStretch()
+        self.pagina_resultados.setLayout(layout)
+        self.pages.addWidget(self.pagina_resultados)
+
+    def solicitar_actualizacion_servidor_analisis(self):
+        """Pide el estado de procesamiento por HTTP GET y renderiza los bytes de imágenes"""
+        try:
+            res = requests.get(f"{self.api_url_analizador}/estado").json()
+            
+            self.vin_ult_label.setText(res["vin_ult_data"])
+            self.datamatrix_link_label.setText(res["datamatrix_link_data"])
+            self.datamatrix_num_label.setText(res["datamatrix_num_data"])
+            self.pkn_largo_label.setText(res["pkn_largo_data"])
+            self.cve_com_label.setText(res["cve_com_data"])
+            self.vin_barra_label.setText(res["vin_barra_data"])
+
+            self.tiempo_procesamiento_label.setText(res["data_tiempo_procesamiento"])
+            num_frame = res["data_num_frame"]
+            num_frame_max = res["data_num_frame_max"]
+            progreso = str(f"{num_frame}/{num_frame_max}")
+            self.num_frame_label.setText(progreso)
+
+            if res["frame"]:
+                self.convertir_b64_a_label(res["frame"], self.main_frame)
+            if res["recorte_vin_ult"]:
+                self.convertir_b64_a_label(res["recorte_vin_ult"], self.vin_ult_frame)
+            if res["recorte_datamatrix_link"]:
+                self.convertir_b64_a_label(res["recorte_datamatrix_link"], self.datamatrix_link_frame)
+            if res["recorte_datamatrix_num"]:
+                self.convertir_b64_a_label(res["recorte_datamatrix_num"], self.datamatrix_num_frame)
+            if res["recorte_pkn_largo"]:
+                self.convertir_b64_a_label(res["recorte_pkn_largo"], self.pkn_largo_frame)
+            if res["recorte_cve_com"]:
+                self.convertir_b64_a_label(res["recorte_cve_com"], self.cve_com_frame)
+            if res["recorte_vin_barra"]:
+                self.convertir_b64_a_label(res["recorte_vin_barra"], self.vin_barra_frame)
+
+            if not res["corriendo"] and res["frame"] is not None:
+                self.timer_actualizador.stop()
+                QMessageBox.information(self, "Terminado", "El análisis del video concluyó exitosamente.")
+                
+        except Exception as e:
+            self.timer_actualizador.stop()
+            print(f"Error al conectar con la API: {e}")
+
+    def solicitar_actualizacion_servidor_grafica(self):
+        """Pide el estado de procesamiento por HTTP GET y renderiza los bytes de imágenes"""
+        try:
+            res = requests.get(f"{self.api_url_graficador}/estado").json()
+            
+            if res["grafica"]:
+                self.convertir_b64_a_label(res["grafica"], self.graph_frame)
+
+            if not res["corriendo"] and res["frame_actual_base64"] is not None:
+                self.timer_actualizador.stop()
+                QMessageBox.information(self, "Terminado", "El análisis del video concluyó exitosamente.")
+                
+        except Exception as e:
+            self.timer_actualizador.stop()
+            print(f"Error al conectar con la API: {e}")
+
+    def convertir_b64_a_label(self, base64_str, label_target):
+        img_data = base64.b64decode(base64_str)
+        qimage = QImage.fromData(img_data)
+        pixmap = QPixmap.fromImage(qimage)
+        label_target.setPixmap(pixmap.scaled(label_target.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    def actualizar_video_seleccionado(self, ruta_archivo):
+        """MÉTODO CORREGIDO: Guarda la ruta del archivo y actualiza la UI"""
+        self.video_seleccionado = ruta_archivo
+        nombre_corto = os.path.basename(ruta_archivo)
+        
+        # Modificar visualización del Label a éxito verde
+        self.label_video.setText(f"<b>Archivo listo:</b> {nombre_corto}")
+        self.label_video.setStyleSheet("color: #27ae60; font-size: 13px; padding: 5px; background-color: #f5fbf7; border: 1px solid #27ae60;")
+
+    def actualizar_srt_seleccionado(self, ruta_archivo):
+        """MÉTODO CORREGIDO: Guarda la ruta del archivo y actualiza la UI"""
+        self.srt_seleccionado = ruta_archivo
+        nombre_corto = os.path.basename(ruta_archivo)
+        
+        # Modificar visualización del Label a éxito verde
+        self.label_subtitulos.setText(f"<b>Archivo listo:</b> {nombre_corto}")
+        self.label_subtitulos.setStyleSheet("color: #27ae60; font-size: 13px; padding: 5px; background-color: #f5fbf7; border: 1px solid #27ae60;")
+
+    def iniciar_analisis(self):
+        if not self.video_seleccionado:
+            QMessageBox.warning(self, "Falta archivo", "Por favor introduce el archivo faltante.")
+            return
+        
+        try:
+            res_video = requests.post(f"{self.api_url_analizador}/iniciar", json={"ruta_video": self.video_seleccionado})
+            res_grafo = requests.post(f"{self.api_url_graficador}/iniciar", json={"ruta_waypoint": self.srt_seleccionado})
+            if res_video.status_code == 200 and res_grafo.status_code == 200:
+                self.pages.setCurrentIndex(3)
+                self.timer_actualizador.start()
+            else:
+                raise requests.exceptions.RequestException
+        except Exception:
+            msg = QMessageBox(QMessageBox.Critical, "Conexión Fallida", "No se pudo comunicar con los servidores API. Verifica que FastAPI esté corriendo.", parent=self)
+            msg.setStyleSheet("QLabel{ color: #c0392b; }")
+            msg.exec()
+
+    def iniciar_procesamiento_datos(self):
+        try:
+            requests.post(f"{self.api_url_procesador}/iniciar", json={"iniciar": int(1)}, timeout=3)
+        except Exception as e:
+            print(f"[ERROR CONFIG] No se pudo iniciar el procesador de datos: {e}")
+
+    def pausar_analisis(self):
+        try:
+            res_video = requests.post(f"{self.api_url_analizador}/parar", json={"pausa_video": int(0)}, timeout=3)
+            res_grafo = requests.post(f"{self.api_url_graficador}/parar", json={"pausa_video": int(0)}, timeout=3)
+            if res_video.status_code == 200 and res_grafo.status_code == 200:
+                self.btn_pausa.setStyleSheet("""
+                    QPushButton {
+                        background-color: #5c5c5c; font-weight: bold; font-size: 14px; height: 45px; color: white; border-radius: 6px; border: none;
+                    }
+                    QPushButton:hover { background-color: #5c5c5c; }
+                """)
+
+                self.btn_reanudar.setStyleSheet("""
+                    QPushButton {
+                        background-color: #3bbf2c; font-weight: bold; font-size: 14px; height: 45px; color: white; border-radius: 6px; border: none;
+                    }
+                    QPushButton:hover { background-color: #30a123; }
+                """)
+
+                self.timer_actualizador.stop()
+            else:
+                raise requests.exceptions.RequestException
+        except Exception:
+            msg = QMessageBox(QMessageBox.Critical, "Conexión Fallida", "No se pudo comunicar con los servidores API.\nVerifica que el script launch_sistema.sh esté corriendo.", parent=self)
+            msg.setStyleSheet("QLabel{ color: #c0392b; font-family: 'Segoe UI'; } QPushButton{ background-color: #dcdde1; color: black; }")
+            msg.exec()
+
+    def reanudar_analisis(self):
+        try:
+            res_video = requests.post(f"{self.api_url_analizador}/parar", json={"pausa_video": int(1)}, timeout=3)
+            res_grafo = requests.post(f"{self.api_url_graficador}/parar", json={"pausa_video": int(1)}, timeout=3)
+            if res_video.status_code == 200 and res_grafo.status_code == 200:
+                self.btn_pausa.setStyleSheet("""
+                    QPushButton {
+                        background-color: #e3230e; font-weight: bold; font-size: 14px; height: 45px; color: white; border-radius: 6px; border: none;
+                    }
+                    QPushButton:hover { background-color: #b51e0d; }
+                """)
+
+                self.btn_reanudar.setStyleSheet("""
+                    QPushButton {
+                        background-color: #5c5c5c; font-weight: bold; font-size: 14px; height: 45px; color: white; border-radius: 6px; border: none;
+                    }
+                    QPushButton:hover { background-color: #5c5c5c; }
+                """)
+
+                self.timer_actualizador.start()
+            else:
+                raise requests.exceptions.RequestException
+        except Exception:
+            msg = QMessageBox(QMessageBox.Critical, "Conexión Fallida", "No se pudo comunicar con los servidores API.\nVerifica que el script launch_sistema.sh esté corriendo.", parent=self)
+            msg.setStyleSheet("QLabel{ color: #c0392b; font-family: 'Segoe UI'; } QPushButton{ background-color: #dcdde1; color: black; }")
+            msg.exec()
+        
+
+    def actualizar_datos(self):
+        self.mapa_widget.cargar_mapa()
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+
+    window = DroneDashboard()
+    window.show()
+
+    try:
+        sys.exit(app.exec())
+    except KeyboardInterrupt:
+        print("\nInterrupción por teclado")
+    except Exception as e:
+        print(f"Error: {e}")
+    finally:
+        print("Programa finalizado")

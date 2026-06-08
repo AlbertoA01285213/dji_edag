@@ -38,9 +38,13 @@ ESTADO_PROCESO = {
 }
 
 DEBE_PARAR = False
+ESTA_PAUSADO = False
 
 class WaypointPayload(BaseModel):
     ruta_waypoint: str
+
+class VideoPause(BaseModel):
+    pausa_video: int
 
 
 class GeneradorGrafica3D:
@@ -132,7 +136,7 @@ def bucle_waypoint(waypoint_path):
     logger.info("Iniciando bucle de procesamiento en segundo plano...")
     ESTADO_PROCESO["corriendo"] = True
     ESTADO_PROCESO["frame_actual_base64"] = "procesando"
-    
+
     datos_vuelo = parsear_srt_dji(waypoint_path)
     if not datos_vuelo:
         logger.error("No se pudieron cargar coordenadas del SRT. Cancelando hilo.")
@@ -140,9 +144,12 @@ def bucle_waypoint(waypoint_path):
         return
 
     generador = GeneradorGrafica3D(datos_vuelo)
-    frames_ordenados = sorted(datos_vuelo.keys())
+    frames_ordenados = sorted(datos_vuelo.keys())        
 
     for i,frame_num in enumerate(frames_ordenados):
+        while ESTA_PAUSADO:
+            time.sleep(0.1)
+            
         if DEBE_PARAR:
             logger.warning("Señal de parada interceptada. Saliendo del bucle prematuramente.")
             print("Señal de parada recibida en el graficador.")
@@ -184,12 +191,16 @@ def iniciar_grafica(payload: WaypointPayload, background_tasks: BackgroundTasks)
     return {"status": "success", "message": "Analisis iniciado correctamente"}
 
 @app.post("/parar")
-def parar_analisis():
-    global DEBE_PARAR
+def parar_analisis(payload: VideoPause):
+    global DEBE_PARAR, ESTA_PAUSADO
     if not ESTADO_PROCESO["corriendo"]:
         return {"status": "error", "message": "No hay ningún análisis activo que detener."}
     
-    DEBE_PARAR = True
+    if payload.pausa_video == 0:
+        ESTA_PAUSADO = True
+
+    if payload.pausa_video == 1:
+        ESTA_PAUSADO = False
     return {"status": "success", "message": "Se ha enviado la señal de parada al analizador."}
 
 
